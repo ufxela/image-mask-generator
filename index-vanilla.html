@@ -1,0 +1,777 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Mask Generator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .description {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+
+        .controls {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .file-input-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+        }
+
+        .file-input-wrapper input[type=file] {
+            position: absolute;
+            left: -9999px;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background-color 0.2s;
+        }
+
+        .btn-primary {
+            background-color: #007bff;
+            color: white;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background-color: #0056b3;
+        }
+
+        .btn-success {
+            background-color: #28a745;
+            color: white;
+        }
+
+        .btn-success:hover:not(:disabled) {
+            background-color: #218838;
+        }
+
+        .btn-secondary {
+            background-color: #6c757d;
+            color: white;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background-color: #545b62;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .slider-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .slider-group label {
+            font-size: 14px;
+            color: #666;
+        }
+
+        .slider-group input[type="range"] {
+            width: 150px;
+        }
+
+        .slider-group .value {
+            font-weight: 500;
+            min-width: 30px;
+        }
+
+        .workspace {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .canvas-container {
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+            background: #f9f9f9;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .canvas-container h3 {
+            background: #f0f0f0;
+            padding: 10px 15px;
+            font-size: 14px;
+            color: #333;
+            border-bottom: 1px solid #ddd;
+        }
+
+        .canvas-wrapper {
+            padding: 15px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 300px;
+            flex: 1;
+        }
+
+        canvas {
+            max-width: 100%;
+            height: auto;
+            cursor: crosshair;
+        }
+
+        .status {
+            margin-top: 15px;
+            padding: 10px 15px;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        .status.info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+
+        .status.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .status.warning {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+
+        .status.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+
+        .instructions {
+            background: #e7f3ff;
+            border-left: 4px solid #007bff;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 4px;
+        }
+
+        .instructions h3 {
+            color: #007bff;
+            font-size: 16px;
+            margin-bottom: 8px;
+        }
+
+        .instructions ul {
+            margin-left: 20px;
+            color: #333;
+        }
+
+        .instructions li {
+            margin: 5px 0;
+            font-size: 14px;
+        }
+
+        @media (max-width: 968px) {
+            .workspace {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Image Mask Generator</h1>
+        <p class="description">
+            Upload a photo of a collage, automatically segment it into regions,
+            select the pieces you want to highlight, and generate a black-and-white mask for projection.
+        </p>
+
+        <div class="instructions">
+            <h3>How to Use:</h3>
+            <ul>
+                <li><strong>Upload Image:</strong> Click "Choose Image" to upload a photo of your wall/collage</li>
+                <li><strong>Adjust Sensitivity:</strong> Use the slider to control segmentation detail (lower = fewer, larger regions)</li>
+                <li><strong>Segment:</strong> Click "Segment Image" to divide the image into selectable regions</li>
+                <li><strong>Select Regions:</strong> Hover over regions to highlight them, click to select/deselect</li>
+                <li><strong>Generate Mask:</strong> Click "Create Mask" to generate the black-and-white projection mask</li>
+                <li><strong>Download:</strong> Click "Download Mask" to save the mask image</li>
+            </ul>
+        </div>
+
+        <div class="controls">
+            <div class="file-input-wrapper">
+                <label for="imageUpload" class="btn btn-primary">Choose Image</label>
+                <input type="file" id="imageUpload" accept="image/jpeg,image/png,image/jpg">
+            </div>
+
+            <div class="slider-group">
+                <label for="sensitivitySlider">Sensitivity:</label>
+                <input type="range" id="sensitivitySlider" min="1" max="10" value="5" disabled>
+                <span class="value" id="sensitivityValue">5</span>
+            </div>
+
+            <button id="segmentBtn" class="btn btn-secondary" disabled>Segment Image</button>
+            <button id="clearBtn" class="btn btn-secondary" disabled>Clear Selection</button>
+            <button id="createMaskBtn" class="btn btn-success" disabled>Create Mask</button>
+            <button id="downloadBtn" class="btn btn-success" disabled>Download Mask</button>
+        </div>
+
+        <div id="status" class="status hidden"></div>
+
+        <div class="workspace">
+            <div class="canvas-container">
+                <h3>Original Image with Segmentation</h3>
+                <div class="canvas-wrapper">
+                    <canvas id="originalCanvas"></canvas>
+                </div>
+            </div>
+            <div class="canvas-container">
+                <h3>Generated Mask (White = Selected)</h3>
+                <div class="canvas-wrapper">
+                    <canvas id="maskCanvas"></canvas>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Load OpenCV.js from CDN -->
+    <script async src="https://docs.opencv.org/4.5.2/opencv.js" onload="onOpenCvReady()" type="text/javascript"></script>
+
+    <script>
+        // ============================================================================
+        // GLOBAL STATE
+        // ============================================================================
+
+        let cv = null; // OpenCV.js library
+        let originalImage = null; // Original uploaded image (cv.Mat)
+        let segmentedRegions = []; // Array of region objects {contour, mask, bounds, selected}
+        let displayCanvas = null; // Canvas for displaying original + segmentation
+        let maskCanvas = null; // Canvas for displaying the mask
+        let isOpenCvReady = false;
+        let currentImageElement = null; // HTML image element for uploaded image
+
+        // ============================================================================
+        // DOM ELEMENTS
+        // ============================================================================
+
+        const imageUpload = document.getElementById('imageUpload');
+        const sensitivitySlider = document.getElementById('sensitivitySlider');
+        const sensitivityValue = document.getElementById('sensitivityValue');
+        const segmentBtn = document.getElementById('segmentBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        const createMaskBtn = document.getElementById('createMaskBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const statusDiv = document.getElementById('status');
+        const originalCanvas = document.getElementById('originalCanvas');
+        const maskCanvasElement = document.getElementById('maskCanvas');
+
+        // ============================================================================
+        // OPENCV.JS INITIALIZATION
+        // ============================================================================
+
+        /**
+         * Called when OpenCV.js finishes loading from CDN
+         */
+        function onOpenCvReady() {
+            cv = window.cv;
+            isOpenCvReady = true;
+            showStatus('OpenCV.js loaded successfully. Ready to process images!', 'success');
+            console.log('OpenCV.js version:', cv.getBuildInformation());
+        }
+
+        // ============================================================================
+        // UTILITY FUNCTIONS
+        // ============================================================================
+
+        /**
+         * Display status message to user
+         */
+        function showStatus(message, type = 'info') {
+            statusDiv.textContent = message;
+            statusDiv.className = `status ${type}`;
+            statusDiv.classList.remove('hidden');
+        }
+
+        /**
+         * Hide status message
+         */
+        function hideStatus() {
+            statusDiv.classList.add('hidden');
+        }
+
+        /**
+         * Clean up OpenCV matrices to prevent memory leaks
+         */
+        function cleanupMats(...mats) {
+            mats.forEach(mat => {
+                if (mat && !mat.isDeleted()) {
+                    mat.delete();
+                }
+            });
+        }
+
+        // ============================================================================
+        // IMAGE UPLOAD AND DISPLAY
+        // ============================================================================
+
+        /**
+         * Handle image file upload
+         */
+        imageUpload.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            if (!isOpenCvReady) {
+                showStatus('Please wait for OpenCV.js to load...', 'warning');
+                return;
+            }
+
+            // Validate file type
+            if (!file.type.match('image/(jpeg|png|jpg)')) {
+                showStatus('Please upload a JPEG or PNG image.', 'error');
+                return;
+            }
+
+            showStatus('Loading image...', 'info');
+
+            // Create image element from file
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                const img = new Image();
+                img.onload = function() {
+                    loadImage(img);
+                };
+                img.src = event.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
+
+        /**
+         * Load image into OpenCV and display on canvas
+         */
+        function loadImage(imgElement) {
+            try {
+                // Clean up previous image
+                if (originalImage) {
+                    cleanupMats(originalImage);
+                }
+                segmentedRegions = [];
+
+                currentImageElement = imgElement;
+
+                // Load image into OpenCV Mat
+                const mat = cv.imread(imgElement);
+                originalImage = mat.clone();
+
+                // Set up canvas
+                originalCanvas.width = mat.cols;
+                originalCanvas.height = mat.rows;
+                cv.imshow(originalCanvas, mat);
+
+                // Clear mask canvas
+                maskCanvasElement.width = mat.cols;
+                maskCanvasElement.height = mat.rows;
+                const ctx = maskCanvasElement.getContext('2d');
+                ctx.fillStyle = 'black';
+                ctx.fillRect(0, 0, maskCanvasElement.width, maskCanvasElement.height);
+
+                cleanupMats(mat);
+
+                // Enable controls
+                sensitivitySlider.disabled = false;
+                segmentBtn.disabled = false;
+                clearBtn.disabled = true;
+                createMaskBtn.disabled = true;
+                downloadBtn.disabled = true;
+
+                showStatus('Image loaded successfully! Adjust sensitivity and click "Segment Image".', 'success');
+            } catch (error) {
+                console.error('Error loading image:', error);
+                showStatus('Error loading image: ' + error.message, 'error');
+            }
+        }
+
+        // ============================================================================
+        // IMAGE SEGMENTATION
+        // ============================================================================
+
+        /**
+         * Segment image into regions using watershed algorithm
+         * This is the core computer vision algorithm that divides the image into pieces
+         */
+        function segmentImage() {
+            if (!originalImage) {
+                showStatus('Please upload an image first.', 'error');
+                return;
+            }
+
+            showStatus('Segmenting image... This may take a few seconds.', 'info');
+            segmentBtn.disabled = true;
+
+            // Use setTimeout to allow UI to update before heavy processing
+            setTimeout(() => {
+                try {
+                    const sensitivity = parseInt(sensitivitySlider.value);
+
+                    // Step 1: Convert to grayscale for edge detection
+                    const gray = new cv.Mat();
+                    cv.cvtColor(originalImage, gray, cv.COLOR_RGBA2GRAY);
+
+                    // Step 2: Apply Gaussian blur to reduce noise
+                    const blurred = new cv.Mat();
+                    const ksize = new cv.Size(5, 5);
+                    cv.GaussianBlur(gray, blurred, ksize, 0);
+
+                    // Step 3: Detect edges using Canny edge detector
+                    const edges = new cv.Mat();
+                    // Lower sensitivity = higher thresholds = fewer edges = larger regions
+                    const threshold1 = sensitivity * 10;
+                    const threshold2 = sensitivity * 20;
+                    cv.Canny(blurred, edges, threshold1, threshold2);
+
+                    // Step 4: Dilate edges to close gaps
+                    const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+                    const dilated = new cv.Mat();
+                    cv.dilate(edges, dilated, kernel, new cv.Point(-1, -1), 2);
+
+                    // Step 5: Find contours (boundaries of regions)
+                    const contours = new cv.MatVector();
+                    const hierarchy = new cv.Mat();
+                    cv.findContours(dilated, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+                    // Step 6: Filter and store significant contours as selectable regions
+                    segmentedRegions = [];
+                    const minArea = (originalImage.cols * originalImage.rows) * 0.001; // Minimum 0.1% of image
+
+                    for (let i = 0; i < contours.size(); i++) {
+                        const contour = contours.get(i);
+                        const area = cv.contourArea(contour);
+
+                        if (area > minArea) {
+                            // Create a mask for this region
+                            const mask = cv.Mat.zeros(originalImage.rows, originalImage.cols, cv.CV_8UC1);
+                            const contourVec = new cv.MatVector();
+                            contourVec.push_back(contour);
+                            cv.drawContours(mask, contourVec, 0, new cv.Scalar(255), -1); // Fill contour
+
+                            // Get bounding rectangle for efficient hit testing
+                            const bounds = cv.boundingRect(contour);
+
+                            segmentedRegions.push({
+                                contour: contour.clone(),
+                                mask: mask,
+                                bounds: bounds,
+                                selected: false
+                            });
+
+                            contourVec.delete();
+                        }
+                    }
+
+                    // Step 7: Draw segmentation on original image
+                    displaySegmentation();
+
+                    // Cleanup
+                    cleanupMats(gray, blurred, edges, dilated, kernel, hierarchy);
+                    contours.delete();
+
+                    showStatus(`Found ${segmentedRegions.length} regions. Click regions to select them.`, 'success');
+                    clearBtn.disabled = false;
+                    createMaskBtn.disabled = false;
+                    segmentBtn.disabled = false;
+
+                } catch (error) {
+                    console.error('Error during segmentation:', error);
+                    showStatus('Error during segmentation: ' + error.message, 'error');
+                    segmentBtn.disabled = false;
+                }
+            }, 100);
+        }
+
+        /**
+         * Display the original image with segmentation boundaries overlaid
+         */
+        function displaySegmentation(highlightIndex = -1) {
+            if (!originalImage) return;
+
+            const display = originalImage.clone();
+
+            // Draw all region boundaries
+            for (let i = 0; i < segmentedRegions.length; i++) {
+                const region = segmentedRegions[i];
+                const contourVec = new cv.MatVector();
+                contourVec.push_back(region.contour);
+
+                if (i === highlightIndex) {
+                    // Highlighted region (on hover)
+                    cv.drawContours(display, contourVec, 0, new cv.Scalar(255, 255, 0, 255), 3);
+                } else if (region.selected) {
+                    // Selected region
+                    cv.drawContours(display, contourVec, 0, new cv.Scalar(0, 255, 0, 255), 2);
+                } else {
+                    // Unselected region
+                    cv.drawContours(display, contourVec, 0, new cv.Scalar(255, 0, 0, 255), 1);
+                }
+
+                contourVec.delete();
+            }
+
+            cv.imshow(originalCanvas, display);
+            cleanupMats(display);
+        }
+
+        // ============================================================================
+        // INTERACTIVE REGION SELECTION
+        // ============================================================================
+
+        /**
+         * Get mouse position relative to canvas, accounting for canvas scaling
+         */
+        function getMousePos(canvas, evt) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+
+            return {
+                x: (evt.clientX - rect.left) * scaleX,
+                y: (evt.clientY - rect.top) * scaleY
+            };
+        }
+
+        /**
+         * Find which region (if any) contains the given point
+         */
+        function findRegionAtPoint(x, y) {
+            // Check regions in reverse order (top to bottom in z-order)
+            for (let i = segmentedRegions.length - 1; i >= 0; i--) {
+                const region = segmentedRegions[i];
+                const bounds = region.bounds;
+
+                // Quick bounds check first
+                if (x < bounds.x || x >= bounds.x + bounds.width ||
+                    y < bounds.y || y >= bounds.y + bounds.height) {
+                    continue;
+                }
+
+                // Precise check using the mask
+                const maskValue = region.mask.ucharAt(Math.floor(y), Math.floor(x));
+                if (maskValue > 0) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        /**
+         * Handle mouse movement over canvas - highlight regions on hover
+         */
+        originalCanvas.addEventListener('mousemove', function(evt) {
+            if (segmentedRegions.length === 0) return;
+
+            const pos = getMousePos(originalCanvas, evt);
+            const regionIndex = findRegionAtPoint(pos.x, pos.y);
+
+            displaySegmentation(regionIndex);
+        });
+
+        /**
+         * Handle mouse leaving canvas - clear highlighting
+         */
+        originalCanvas.addEventListener('mouseleave', function() {
+            if (segmentedRegions.length === 0) return;
+            displaySegmentation(-1);
+        });
+
+        /**
+         * Handle click on canvas - select/deselect regions
+         */
+        originalCanvas.addEventListener('click', function(evt) {
+            if (segmentedRegions.length === 0) return;
+
+            const pos = getMousePos(originalCanvas, evt);
+            const regionIndex = findRegionAtPoint(pos.x, pos.y);
+
+            if (regionIndex !== -1) {
+                // Toggle selection
+                segmentedRegions[regionIndex].selected = !segmentedRegions[regionIndex].selected;
+                displaySegmentation(regionIndex);
+
+                const selectedCount = segmentedRegions.filter(r => r.selected).length;
+                showStatus(`${selectedCount} region(s) selected`, 'info');
+            }
+        });
+
+        // ============================================================================
+        // MASK GENERATION
+        // ============================================================================
+
+        /**
+         * Generate black-and-white mask from selected regions
+         * White = selected regions, Black = unselected regions
+         */
+        function createMask() {
+            if (!originalImage) {
+                showStatus('Please upload an image first.', 'error');
+                return;
+            }
+
+            if (segmentedRegions.length === 0) {
+                showStatus('Please segment the image first.', 'error');
+                return;
+            }
+
+            const selectedCount = segmentedRegions.filter(r => r.selected).length;
+            if (selectedCount === 0) {
+                showStatus('Please select at least one region.', 'warning');
+                return;
+            }
+
+            try {
+                // Create black mask
+                const mask = cv.Mat.zeros(originalImage.rows, originalImage.cols, cv.CV_8UC1);
+
+                // Fill selected regions with white
+                for (let region of segmentedRegions) {
+                    if (region.selected) {
+                        const contourVec = new cv.MatVector();
+                        contourVec.push_back(region.contour);
+                        cv.drawContours(mask, contourVec, 0, new cv.Scalar(255), -1);
+                        contourVec.delete();
+                    }
+                }
+
+                // Display mask on canvas
+                maskCanvasElement.width = mask.cols;
+                maskCanvasElement.height = mask.rows;
+                cv.imshow(maskCanvasElement, mask);
+
+                cleanupMats(mask);
+
+                downloadBtn.disabled = false;
+                showStatus(`Mask created successfully with ${selectedCount} selected region(s)!`, 'success');
+
+            } catch (error) {
+                console.error('Error creating mask:', error);
+                showStatus('Error creating mask: ' + error.message, 'error');
+            }
+        }
+
+        /**
+         * Download the generated mask as PNG file
+         */
+        function downloadMask() {
+            try {
+                // Convert canvas to blob and download
+                maskCanvasElement.toBlob(function(blob) {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'mask.png';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+
+                    showStatus('Mask downloaded successfully!', 'success');
+                });
+            } catch (error) {
+                console.error('Error downloading mask:', error);
+                showStatus('Error downloading mask: ' + error.message, 'error');
+            }
+        }
+
+        /**
+         * Clear all region selections
+         */
+        function clearSelection() {
+            segmentedRegions.forEach(region => region.selected = false);
+            displaySegmentation(-1);
+            showStatus('Selection cleared.', 'info');
+        }
+
+        // ============================================================================
+        // EVENT LISTENERS
+        // ============================================================================
+
+        sensitivitySlider.addEventListener('input', function() {
+            sensitivityValue.textContent = this.value;
+        });
+
+        segmentBtn.addEventListener('click', segmentImage);
+        clearBtn.addEventListener('click', clearSelection);
+        createMaskBtn.addEventListener('click', createMask);
+        downloadBtn.addEventListener('click', downloadMask);
+
+        // ============================================================================
+        // CLEANUP ON PAGE UNLOAD
+        // ============================================================================
+
+        window.addEventListener('beforeunload', function() {
+            // Clean up OpenCV resources
+            if (originalImage) {
+                cleanupMats(originalImage);
+            }
+            segmentedRegions.forEach(region => {
+                cleanupMats(region.mask);
+                if (region.contour && !region.contour.isDeleted()) {
+                    region.contour.delete();
+                }
+            });
+        });
+
+    </script>
+</body>
+</html>
