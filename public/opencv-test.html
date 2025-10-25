@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenCV.js Test</title>
+    <style>
+        body {
+            font-family: monospace;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .test {
+            background: white;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .pass { border-left: 4px solid #28a745; }
+        .fail { border-left: 4px solid #dc3545; }
+        .pending { border-left: 4px solid #ffc107; }
+        pre {
+            background: #f0f0f0;
+            padding: 10px;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body>
+    <h1>OpenCV.js Diagnostic Test</h1>
+    <div id="results"></div>
+
+    <script async src="https://docs.opencv.org/4.5.2/opencv.js" onload="runTests()" type="text/javascript"></script>
+
+    <script>
+        function log(test Name, status, details = '') {
+            const div = document.createElement('div');
+            div.className = `test ${status}`;
+            div.innerHTML = `
+                <strong>${testName}</strong>: ${status.toUpperCase()}
+                ${details ? `<pre>${details}</pre>` : ''}
+            `;
+            document.getElementById('results').appendChild(div);
+        }
+
+        function runTests() {
+            log('OpenCV.js Load', 'pass', 'OpenCV.js loaded successfully');
+
+            try {
+                // Test 1: Check cv object
+                if (typeof window.cv === 'undefined') {
+                    throw new Error('window.cv is undefined');
+                }
+                log('cv object', 'pass', `typeof cv: ${typeof cv}`);
+
+                // Test 2: Check cv.Mat
+                if (typeof cv.Mat !== 'function') {
+                    throw new Error('cv.Mat is not a function');
+                }
+                log('cv.Mat', 'pass', 'cv.Mat constructor available');
+
+                // Test 3: Create a Mat
+                const testMat = new cv.Mat(100, 100, cv.CV_8UC1);
+                log('Mat creation', 'pass', `Created ${testMat.rows}x${testMat.cols} Mat`);
+
+                // Test 4: Check critical functions
+                const functions = [
+                    'cvtColor',
+                    'GaussianBlur',
+                    'Sobel',
+                    'magnitude',
+                    'normalize',
+                    'watershed',
+                    'findContours',
+                    'drawContours',
+                    'boundingRect',
+                    'contourArea'
+                ];
+
+                let missing = [];
+                functions.forEach(func => {
+                    if (typeof cv[func] !== 'function') {
+                        missing.push(func);
+                    }
+                });
+
+                if (missing.length > 0) {
+                    log('Function availability', 'fail', `Missing functions:\n${missing.join('\n')}`);
+                } else {
+                    log('Function availability', 'pass', `All ${functions.length} functions available`);
+                }
+
+                // Test 5: Check constants
+                const constants = [
+                    'CV_8U',
+                    'CV_8UC1',
+                    'CV_32S',
+                    'CV_32F',
+                    'COLOR_RGBA2GRAY',
+                    'COLOR_GRAY2BGR',
+                    'NORM_MINMAX',
+                    'RETR_EXTERNAL',
+                    'CHAIN_APPROX_SIMPLE'
+                ];
+
+                let missingConstants = [];
+                constants.forEach(constant => {
+                    if (typeof cv[constant] === 'undefined') {
+                        missingConstants.push(constant);
+                    }
+                });
+
+                if (missingConstants.length > 0) {
+                    log('Constants', 'fail', `Missing constants:\n${missingConstants.join('\n')}`);
+                } else {
+                    log('Constants', 'pass', `All ${constants.length} constants available`);
+                }
+
+                // Test 6: Test watershed specifically
+                try {
+                    const img = new cv.Mat(100, 100, cv.CV_8UC3);
+                    const markers = cv.Mat.zeros(100, 100, cv.CV_32S);
+                    markers.intPtr(50, 50)[0] = 1;
+
+                    cv.watershed(img, markers);
+
+                    log('watershed function', 'pass', 'watershed executed successfully');
+
+                    img.delete();
+                    markers.delete();
+                } catch (e) {
+                    log('watershed function', 'fail', `Error: ${e.message}\n${e.stack}`);
+                }
+
+                // Test 7: Test magnitude
+                try {
+                    const gradX = new cv.Mat(100, 100, cv.CV_32F);
+                    const gradY = new cv.Mat(100, 100, cv.CV_32F);
+                    const gradient = new cv.Mat();
+
+                    if (typeof cv.magnitude === 'function') {
+                        cv.magnitude(gradX, gradY, gradient);
+                        log('magnitude function', 'pass', 'magnitude executed successfully');
+                    } else {
+                        log('magnitude function', 'fail', 'cv.magnitude is not a function');
+                    }
+
+                    gradX.delete();
+                    gradY.delete();
+                    gradient.delete();
+                } catch (e) {
+                    log('magnitude function', 'fail', `Error: ${e.message}`);
+                }
+
+                // Test 8: OpenCV build info
+                try {
+                    const buildInfo = cv.getBuildInformation();
+                    log('Build information', 'pass', buildInfo.substring(0, 500) + '...');
+                } catch (e) {
+                    log('Build information', 'pending', 'getBuildInformation not available');
+                }
+
+                testMat.delete();
+
+            } catch (error) {
+                log('Overall test', 'fail', `${error.message}\n${error.stack}`);
+            }
+        }
+
+        // Timeout check
+        setTimeout(() => {
+            if (typeof window.cv === 'undefined') {
+                log('OpenCV.js Load', 'fail', 'Timed out waiting for OpenCV.js to load');
+            }
+        }, 30000);
+    </script>
+</body>
+</html>

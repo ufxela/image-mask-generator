@@ -415,6 +415,7 @@ function App() {
             <h3>Original Image with Segmentation</h3>
             <div className="canvas-wrapper">
               <canvas
+                id="originalCanvas"
                 ref={segmentationCanvasRef}
                 onMouseMove={handleCanvasMouseMove}
                 onMouseLeave={handleCanvasMouseLeave}
@@ -426,7 +427,7 @@ function App() {
           <div className="canvas-container">
             <h3>Generated Mask (White = Selected)</h3>
             <div className="canvas-wrapper">
-              <canvas ref={maskCanvasRef} />
+              <canvas id="maskCanvas" ref={maskCanvasRef} />
             </div>
           </div>
         </div>

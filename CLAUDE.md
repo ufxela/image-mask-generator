@@ -27,6 +27,27 @@ npm run build
 npm run preview
 ```
 
+**Testing:**
+```bash
+# Run unit tests (Vitest)
+npm run test
+
+# Run unit tests once
+npm run test:run
+
+# Run unit tests with UI
+npm run test:ui
+
+# Run browser integration tests (Playwright)
+npm run test:integration
+
+# Run integration tests with UI
+npm run test:integration:ui
+
+# Debug integration tests
+npm run test:integration:debug
+```
+
 **Deployment:**
 The app automatically deploys to GitHub Pages via GitHub Actions on every push to `main` branch.
 
@@ -75,10 +96,13 @@ Modern React application built with Vite for fast development and optimized prod
    - Ensures OpenCV is ready before allowing image operations
 
 3. **segmentation.js** - Computer vision utilities
-   - `segmentImage()`: Edge detection → Contour finding → Region extraction
-     - Pipeline: Grayscale → Blur → Canny edges → Dilation → findContours
-     - Sensitivity slider controls Canny thresholds (lower = fewer regions)
-     - Filters by minimum area (0.1% of image) to remove noise
+   - `segmentImage()`: Watershed segmentation for complete coverage
+     - Pipeline: Grayscale → Blur → Gradient (Sobel) → Grid markers → Watershed
+     - Ensures every pixel belongs to exactly one region (no gaps)
+     - Creates compact, blob-like regions (< 1/10th image dimensions)
+     - Gradient guides watershed to follow edges in the image
+     - Sensitivity controls marker spacing (lower = fewer/larger regions)
+     - Grid-based markers ensure size constraints and uniform coverage
    - `drawSegmentation()`: Renders regions with color-coded boundaries
      - Red (unselected), Green (selected), Yellow (hover)
    - `findRegionAtPoint()`: Hit-testing for interactive selection
@@ -91,6 +115,43 @@ Modern React application built with Vite for fast development and optimized prod
    - Builds React app with Vite
    - Deploys to GitHub Pages automatically
    - Uses artifacts for build/deploy separation
+
+## Testing
+
+**Unit Tests (Vitest):**
+Located in `src/tests/`, these test core utility functions:
+- Memory management (`cleanupMats`)
+- Hit-testing (`findRegionAtPoint`)
+- Coordinate transformations (`getCanvasMousePosition`)
+- Algorithm properties (grid spacing calculations)
+
+19 unit tests covering edge cases, null handling, and boundary conditions.
+
+**Integration Tests (Playwright):**
+Located in `tests/integration/`, these test the full application with real OpenCV.js:
+
+1. **Full Segmentation Pipeline Test:**
+   - Loads the app and waits for OpenCV.js
+   - Uploads test image (5006x3534 pixels)
+   - Performs segmentation
+   - Validates complete pipeline execution:
+     - Image downscaling (17.7M → 2.8M pixels)
+     - All 8 segmentation steps
+     - Region extraction and validation
+   - Tests region selection and mask creation
+
+2. **Sensitivity Variation Test:**
+   - Tests segmentation at different sensitivity levels
+   - Validates that higher sensitivity produces more regions
+   - Ensures algorithm behaves consistently across parameters
+
+**Test Results:**
+The integration tests verify that:
+- ✅ Segmentation completes without errors
+- ✅ Memory optimizations work (cropped masks, immediate cleanup)
+- ✅ Watershed algorithm executes successfully
+- ✅ Complete image coverage (every pixel in exactly one region)
+- ✅ Region count and properties are reasonable
 
 ## Technology Stack
 

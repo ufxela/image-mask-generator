@@ -66,6 +66,15 @@ npm install
 # Start dev server
 npm run dev
 
+# Run unit tests
+npm run test
+
+# Run tests once
+npm run test:run
+
+# Run tests with UI
+npm run test:ui
+
 # Build for production
 npm run build
 
@@ -76,17 +85,29 @@ npm run preview
 npm run deploy
 ```
 
+## Documentation
+
+- **[Testing Guide](docs/TESTING.md)** - Unit tests, integration tests, and manual testing procedures
+- **[Segmentation Algorithm](docs/SEGMENTATION_ALGORITHM.md)** - Technical deep-dive into the watershed algorithm
+
 ## How It Works
 
-The segmentation pipeline:
+The segmentation pipeline uses **watershed segmentation** for complete image coverage:
 1. Convert image to grayscale
 2. Apply Gaussian blur to reduce noise
-3. Detect edges using Canny edge detector
-4. Dilate edges to close gaps
-5. Find contours (region boundaries)
-6. Filter by minimum area to remove noise
-7. Allow interactive selection of regions
-8. Generate binary mask from selected regions
+3. Compute gradient magnitude (Sobel operator) to detect edge strength
+4. Create markers on a regular grid (spacing based on sensitivity)
+5. Apply watershed algorithm using gradient to guide region boundaries
+6. Extract regions - every pixel belongs to exactly one region
+7. Create compact, blob-like regions (< 1/10th image dimensions)
+8. Allow interactive selection of regions
+9. Generate binary mask from selected regions
+
+**Key Features:**
+- Complete coverage: No gaps between regions
+- Edge-aware: Boundaries follow strong edges in the image
+- Size-constrained: Regions are compact and uniformly sized
+- Multiple segments per object: Select multiple regions to highlight complete objects
 
 ## License
 
