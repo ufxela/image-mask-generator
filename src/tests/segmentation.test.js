@@ -61,7 +61,10 @@ describe('Segmentation Utilities', () => {
       mockRegions = [
         {
           bounds: { x: 0, y: 0, width: 100, height: 100 },
+          scaleFactor: 1, // No scaling
           mask: {
+            cols: 100,
+            rows: 100,
             ucharAt: (y, x) => {
               // Simulate a circular region
               const centerX = 50;
@@ -74,16 +77,22 @@ describe('Segmentation Utilities', () => {
         },
         {
           bounds: { x: 100, y: 100, width: 100, height: 100 },
+          scaleFactor: 1, // No scaling
           mask: {
+            cols: 100,
+            rows: 100,
             ucharAt: (y, x) => {
-              // Simulate a rectangular region
-              return (x >= 110 && x <= 190 && y >= 110 && y <= 190) ? 255 : 0;
+              // Simulate a rectangular region (bounds in downscaled space)
+              return (x >= 10 && x <= 90 && y >= 10 && y <= 90) ? 255 : 0;
             }
           }
         },
         {
           bounds: { x: 200, y: 0, width: 100, height: 100 },
+          scaleFactor: 1, // No scaling
           mask: {
+            cols: 100,
+            rows: 100,
             ucharAt: () => 255 // Fully filled region
           }
         }
@@ -118,11 +127,21 @@ describe('Segmentation Utilities', () => {
       const overlappingRegions = [
         {
           bounds: { x: 0, y: 0, width: 200, height: 200 },
-          mask: { ucharAt: () => 255 }
+          scaleFactor: 1,
+          mask: {
+            cols: 200,
+            rows: 200,
+            ucharAt: () => 255
+          }
         },
         {
           bounds: { x: 50, y: 50, width: 100, height: 100 },
-          mask: { ucharAt: () => 255 }
+          scaleFactor: 1,
+          mask: {
+            cols: 100,
+            rows: 100,
+            ucharAt: () => 255
+          }
         }
       ];
 
@@ -264,7 +283,7 @@ describe('Segmentation Algorithm Properties', () => {
     const properties = {
       completeCoverage: 'Every pixel belongs to exactly one region',
       blobLike: 'Regions are compact and roughly circular',
-      sizeConstrained: 'Regions are < 1/10th of image dimensions',
+      sizeConstrained: 'Regions are < 1/20th of image dimensions (updated from 1/10th for smaller regions)',
       edgeAware: 'Region boundaries follow strong edges',
       sensitivity: 'Lower sensitivity = fewer/larger regions',
       gridBased: 'Markers placed on uniform grid for predictable sizing'
@@ -273,36 +292,73 @@ describe('Segmentation Algorithm Properties', () => {
     expect(Object.keys(properties)).toHaveLength(6);
     expect(properties.completeCoverage).toBeDefined();
     expect(properties.edgeAware).toBeDefined();
+    expect(properties.sizeConstrained).toContain('1/20th');
   });
 
   it('should calculate correct grid spacing', () => {
-    // Test the spacing calculation logic
+    // Test the NEW spacing calculation logic (updated to create smaller regions)
     const imageSize = 1000;
-    const maxRegionSize = imageSize / 10; // 100px
-    const baseSpacing = maxRegionSize * 0.8; // 80px
+    const maxRegionSize = imageSize / 20; // 50px (changed from /10 to /20)
+    const baseSpacing = maxRegionSize * 0.7; // 35px (changed from 0.8 to 0.7)
 
-    // Sensitivity 1 (low): spacingMultiplier = 1.5 - 0.1 = 1.4
-    const spacing1 = Math.floor(baseSpacing * 1.4); // 112px
-    expect(spacing1).toBe(112);
+    // Sensitivity 1 (low): spacingMultiplier = 1.3 - 0.11 = 1.19
+    const spacing1 = Math.max(10, Math.floor(baseSpacing * 1.19)); // 41px
+    expect(spacing1).toBe(41);
 
-    // Sensitivity 5 (medium): spacingMultiplier = 1.5 - 0.5 = 1.0
-    const spacing5 = Math.floor(baseSpacing * 1.0); // 80px
-    expect(spacing5).toBe(80);
+    // Sensitivity 5 (medium): spacingMultiplier = 1.3 - 0.55 = 0.75
+    const spacing5 = Math.max(10, Math.floor(baseSpacing * 0.75)); // 26px
+    expect(spacing5).toBe(26);
 
-    // Sensitivity 10 (high): spacingMultiplier = 1.5 - 1.0 = 0.5
-    const spacing10 = Math.floor(baseSpacing * 0.5); // 40px
-    expect(spacing10).toBe(40);
+    // Sensitivity 10 (high): spacingMultiplier = 1.3 - 1.1 = 0.2
+    const spacing10 = Math.max(10, Math.floor(baseSpacing * 0.2)); // 10px (minimum)
+    expect(spacing10).toBe(10);
 
     // Verify sensitivity inversely affects spacing
     expect(spacing1).toBeGreaterThan(spacing5);
     expect(spacing5).toBeGreaterThan(spacing10);
   });
 
-  it('should enforce minimum spacing of 15px', () => {
-    const baseSpacing = 10; // Very small
+  it('should enforce minimum spacing of 10px', () => {
+    const baseSpacing = 5; // Very small
     const spacingMultiplier = 0.5;
-    const spacing = Math.max(15, Math.floor(baseSpacing * spacingMultiplier));
+    const spacing = Math.max(10, Math.floor(baseSpacing * spacingMultiplier));
 
-    expect(spacing).toBe(15);
+    expect(spacing).toBe(10);
+  });
+
+  it('should calculate marker count for different image sizes', () => {
+    // Helper function to calculate marker count
+    const calculateMarkerCount = (width, height, spacing) => {
+      const cols = Math.floor((width - Math.floor(spacing / 2)) / spacing) + 1;
+      const rows = Math.floor((height - Math.floor(spacing / 2)) / spacing) + 1;
+      return cols * rows;
+    };
+
+    // Test case 1: Small image
+    const smallMarkers = calculateMarkerCount(500, 500, 50);
+    expect(smallMarkers).toBeLessThan(5000); // Should be well under limit
+    expect(smallMarkers).toBe(100); // 10x10 grid
+
+    // Test case 2: Medium image (like downscaled 2MP)
+    const mediumMarkers = calculateMarkerCount(1999, 1411, 37);
+    expect(mediumMarkers).toBeLessThan(5000); // Should be under new limit
+    expect(mediumMarkers).toBeGreaterThan(2000); // But can exceed old limit
+    expect(mediumMarkers).toBe(2052); // Actual value from user's error
+
+    // Test case 3: Large image at max size
+    const largeMarkers = calculateMarkerCount(2000, 2000, 30);
+    expect(largeMarkers).toBeLessThan(5000);
+    expect(largeMarkers).toBe(4489); // 67x67 grid
+  });
+
+  it('should document marker limit increase', () => {
+    const markerLimits = {
+      old: 2000,
+      new: 5000,
+      reason: 'Support larger images (up to 2000x2000) at higher sensitivity'
+    };
+
+    expect(markerLimits.new).toBe(5000);
+    expect(markerLimits.new).toBeGreaterThan(markerLimits.old);
   });
 });

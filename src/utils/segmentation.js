@@ -114,14 +114,15 @@ export function segmentImage(originalImage, sensitivity, cv) {
 
     // Step 5: Create markers on a regular grid
     // Sensitivity controls marker spacing (lower = larger spacing = larger/fewer regions)
-    // Target: regions should be < 1/10th image dimensions
+    // Target: regions should be < 1/20th image dimensions, biased toward smaller
     console.log('[Segmentation] Step 5: Creating grid markers');
-    const maxRegionSize = Math.min(workingImage.cols, workingImage.rows) / 10;
-    const baseSpacing = maxRegionSize * 0.8; // Slightly smaller to ensure size constraint
+    const maxRegionSize = Math.min(workingImage.cols, workingImage.rows) / 20;
+    const baseSpacing = maxRegionSize * 0.7; // Base spacing for medium-small regions
 
-    // Sensitivity adjusts spacing: 1 (low) = larger spacing, 10 (high) = smaller spacing
-    const spacingMultiplier = 1.5 - (sensitivity / 10); // Range: 0.5 to 1.4
-    const spacing = Math.max(15, Math.floor(baseSpacing * spacingMultiplier));
+    // Sensitivity adjusts spacing: 1 (low) = larger spacing, 10 (high) = much smaller spacing
+    // Use exponential curve to bias heavily toward smaller regions
+    const spacingMultiplier = 1.3 - (sensitivity / 10) * 1.1; // Range: 0.2 to 1.2
+    const spacing = Math.max(10, Math.floor(baseSpacing * spacingMultiplier));
 
     console.log(`[Segmentation] Grid spacing: ${spacing}px, Max region size: ${maxRegionSize}px`);
 
@@ -136,7 +137,14 @@ export function segmentImage(originalImage, sensitivity, cv) {
       }
     }
 
-    console.log(`[Segmentation] Created ${markerLabel - 1} markers`);
+    const markerCount = markerLabel - 1;
+    console.log(`[Segmentation] Created ${markerCount} markers`);
+
+    // Safety check: too many markers can cause memory issues
+    // For a 2000x2000 image with small spacing, we might need 3000-5000 markers
+    if (markerCount > 5000) {
+      throw new Error(`Too many markers (${markerCount}). Try reducing sensitivity.`);
+    }
 
     // Step 6: Apply watershed algorithm
     // Watershed needs a 3-channel image
@@ -162,14 +170,16 @@ export function segmentImage(originalImage, sensitivity, cv) {
     // Step 7: Extract regions from watershed result
     // Watershed labels: -1 = boundary, 0 = background, >0 = region labels
     console.log('[Segmentation] Step 7: Extracting regions');
-    const regionMasks = new Map();
 
-    // Build a mask for each region
-    // Note: This is a pixel-by-pixel scan which can be slow for large images
+    // MEMORY-EFFICIENT APPROACH: Collect pixel coordinates first, then create masks only for valid regions
+    // This avoids creating 2000+ full-sized masks which would consume ~5-10GB of memory
+    const regionPoints = new Map(); // Map<label, Array<{x, y}>>
+    const minArea = (workingImage.cols * workingImage.rows) * 0.0001; // 0.01% minimum
+
     console.log(`[Segmentation] Scanning ${markers.rows * markers.cols} pixels...`);
 
     try {
-      // Process in chunks to avoid memory issues with very large images
+      // First pass: collect pixel coordinates for each region
       const chunkSize = 100; // Process 100 rows at a time
       for (let startY = 0; startY < markers.rows; startY += chunkSize) {
         const endY = Math.min(startY + chunkSize, markers.rows);
@@ -181,19 +191,21 @@ export function segmentImage(originalImage, sensitivity, cv) {
               label = markers.intPtr(y, x)[0];
             } catch (e) {
               console.error(`[Segmentation] Error accessing marker at (${y}, ${x}):`, e);
-              throw new Error(`Failed to read marker at (${y}, ${x}): ${e.message}`);
+              // OpenCV.js may throw numeric error codes instead of Error objects
+              const errorMsg = typeof e === 'object' && e.message ? e.message : String(e);
+              throw new Error(`Failed to read marker at (${y}, ${x}): ${errorMsg}`);
+            }
+
+            // Validate label value
+            if (label === undefined || label === null || isNaN(label)) {
+              throw new Error(`Invalid marker label at (${y}, ${x}): ${label}`);
             }
 
             if (label > 0) { // Valid region (not boundary or background)
-              if (!regionMasks.has(label)) {
-                regionMasks.set(label, cv.Mat.zeros(workingImage.rows, workingImage.cols, cv.CV_8U));
+              if (!regionPoints.has(label)) {
+                regionPoints.set(label, []);
               }
-              try {
-                regionMasks.get(label).ucharPtr(y, x)[0] = 255;
-              } catch (e) {
-                console.error(`[Segmentation] Error setting mask pixel at (${y}, ${x}):`, e);
-                throw new Error(`Failed to set mask pixel at (${y}, ${x}): ${e.message}`);
-              }
+              regionPoints.get(label).push({ x, y });
             }
           }
         }
@@ -205,68 +217,120 @@ export function segmentImage(originalImage, sensitivity, cv) {
       }
     } catch (e) {
       console.error('[Segmentation] Error during region extraction:', e);
-      // Clean up any partially created masks
-      regionMasks.forEach(mask => mask.delete());
-      throw e;
+      // Ensure we throw a proper Error object, not a numeric code
+      if (e instanceof Error) {
+        throw e;
+      } else {
+        throw new Error(`Region extraction failed with code: ${e}`);
+      }
     }
 
-    console.log(`[Segmentation] Found ${regionMasks.size} regions from watershed`);
+    console.log(`[Segmentation] Found ${regionPoints.size} regions from watershed`);
 
-    // Step 8: Convert each mask to contour and create region objects
-    console.log('[Segmentation] Step 8: Converting masks to contours');
-    const minArea = (workingImage.cols * workingImage.rows) * 0.0001; // 0.01% minimum
+    // Step 8: Create masks and contours only for regions that meet minimum area
+    console.log('[Segmentation] Step 8: Creating masks and contours for valid regions');
 
     let processedCount = 0;
-    for (const [label, mask] of regionMasks.entries()) {
+    for (const [label, points] of regionPoints.entries()) {
       try {
+        // Skip regions that are too small
+        if (points.length < minArea) {
+          processedCount++;
+          continue;
+        }
+
+        // Calculate bounding box from points
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const pt of points) {
+          if (pt.x < minX) minX = pt.x;
+          if (pt.x > maxX) maxX = pt.x;
+          if (pt.y < minY) minY = pt.y;
+          if (pt.y > maxY) maxY = pt.y;
+        }
+
+        const bounds = {
+          x: minX,
+          y: minY,
+          width: maxX - minX + 1,
+          height: maxY - minY + 1
+        };
+
+        // Validate bounds
+        if (bounds.width <= 0 || bounds.height <= 0) {
+          console.warn(`[Segmentation] Skipping invalid bounds for region ${label}`);
+          processedCount++;
+          continue;
+        }
+
+        // Create a CROPPED mask (only as large as the bounding box)
+        const mask = cv.Mat.zeros(bounds.height, bounds.width, cv.CV_8U);
+
+        // Fill the mask with points (translated to local coordinates)
+        for (const pt of points) {
+          const localX = pt.x - minX;
+          const localY = pt.y - minY;
+          if (localX >= 0 && localX < bounds.width && localY >= 0 && localY < bounds.height) {
+            mask.ucharPtr(localY, localX)[0] = 255;
+          }
+        }
+
+        // Find contours from this mask
         const contours = new cv.MatVector();
         const hierarchy = new cv.Mat();
-
-        // Find contours for this region
         cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
         if (contours.size() > 0) {
           const contour = contours.get(0);
+
+          // Validate contour
+          if (!contour || contour.rows === 0) {
+            console.warn(`[Segmentation] Skipping empty contour for region ${label}`);
+            hierarchy.delete();
+            contours.delete();
+            mask.delete();
+            processedCount++;
+            continue;
+          }
+
           const area = cv.contourArea(contour);
 
           if (area > minArea) {
-            const bounds = cv.boundingRect(contour);
+            // Translate contour coordinates back to image space
+            const translatedContour = new cv.Mat(contour.rows, 1, cv.CV_32SC2);
+            for (let i = 0; i < contour.rows; i++) {
+              translatedContour.data32S[i * 2] = contour.data32S[i * 2] + minX;
+              translatedContour.data32S[i * 2 + 1] = contour.data32S[i * 2 + 1] + minY;
+            }
 
-            // Extract only the bounding box region of the mask to save memory
-            const rect = new cv.Rect(bounds.x, bounds.y, bounds.width, bounds.height);
-            const croppedMask = mask.roi(rect);
-
-            // Store contour in downscaled space - we'll scale during drawing
+            // Store region with CROPPED mask (memory efficient)
+            // NOTE: We store translatedContour directly (don't delete it, it's owned by the region now)
             regions.push({
-              contour: contour.clone(),
-              mask: croppedMask.clone(),
+              contour: translatedContour, // We OWN this now, don't delete
+              mask: mask.clone(),
               bounds: bounds, // In downscaled space
               scaleFactor: scaleFactor, // Store for later scaling
               selected: false
             });
 
-            croppedMask.delete();
+            // Don't delete translatedContour - it's now owned by the region!
           }
         }
 
-        // Clean up immediately
+        // Clean up
         hierarchy.delete();
         contours.delete();
-        mask.delete(); // Delete mask immediately after processing
+        mask.delete();
 
         processedCount++;
-        if (processedCount % 50 === 0) {
-          console.log(`[Segmentation] Processed ${processedCount}/${regionMasks.size} regions`);
+        if (processedCount % 100 === 0) {
+          console.log(`[Segmentation] Processed ${processedCount}/${regionPoints.size} regions`);
         }
       } catch (e) {
         console.error(`[Segmentation] Error processing region ${label}:`, e);
-        // Clean up this region's mask
-        mask.delete();
-        throw new Error(`Failed to process region ${label}: ${e.message}`);
+        throw new Error(`Failed to process region ${label}: ${e.message || e}`);
       }
     }
 
-    // Masks already deleted in loop above
     console.log(`[Segmentation] Returning ${regions.length} valid regions`);
 
   } catch (error) {
@@ -296,16 +360,34 @@ export function segmentImage(originalImage, sensitivity, cv) {
  * @returns {cv.Mat} Scaled contour
  */
 function scaleContour(contour, scale, cv) {
+  if (!contour || contour.rows === 0) {
+    throw new Error('Invalid contour: contour is empty or undefined');
+  }
+
   if (scale === 1) return contour.clone();
+
+  if (!contour.data32S) {
+    throw new Error('Invalid contour: data32S is undefined');
+  }
 
   // Create a new contour with scaled coordinates
   const scaledContour = new cv.Mat(contour.rows, 1, cv.CV_32SC2);
 
-  for (let i = 0; i < contour.rows; i++) {
-    const x = contour.data32S[i * 2];
-    const y = contour.data32S[i * 2 + 1];
-    scaledContour.data32S[i * 2] = Math.round(x * scale);
-    scaledContour.data32S[i * 2 + 1] = Math.round(y * scale);
+  try {
+    for (let i = 0; i < contour.rows; i++) {
+      const x = contour.data32S[i * 2];
+      const y = contour.data32S[i * 2 + 1];
+
+      if (x === undefined || y === undefined) {
+        throw new Error(`Invalid contour data at index ${i}: x=${x}, y=${y}`);
+      }
+
+      scaledContour.data32S[i * 2] = Math.round(x * scale);
+      scaledContour.data32S[i * 2 + 1] = Math.round(y * scale);
+    }
+  } catch (error) {
+    scaledContour.delete();
+    throw error;
   }
 
   return scaledContour;
@@ -420,7 +502,7 @@ export function createMask(originalImage, regions, canvas, cv) {
   // Create black mask at original image size
   const mask = cv.Mat.zeros(originalImage.rows, originalImage.cols, cv.CV_8UC1);
 
-  // Fill selected regions with white
+  // Fill selected regions with white (no outlines, just filled regions)
   for (let region of selectedRegions) {
     // Scale the contour to match original image size
     const scaleFactor = region.scaleFactor || 1;
@@ -429,10 +511,15 @@ export function createMask(originalImage, regions, canvas, cv) {
 
     const contourVec = new cv.MatVector();
     contourVec.push_back(scaledContour);
+    // Use -1 to fill the contour completely (no outline)
     cv.drawContours(mask, contourVec, 0, new cv.Scalar(255), -1);
     contourVec.delete();
     scaledContour.delete();
   }
+
+  // Apply binary threshold to ensure pure black (0) and white (255) with no gray values
+  // This removes any anti-aliasing or interpolation artifacts
+  cv.threshold(mask, mask, 127, 255, cv.THRESH_BINARY);
 
   // Display on canvas
   canvas.width = mask.cols;

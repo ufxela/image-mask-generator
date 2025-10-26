@@ -23,6 +23,9 @@ function App() {
   const [sensitivity, setSensitivity] = useState(5);
   const [status, setStatus] = useState({ message: '', type: 'info' });
   const [highlightedRegion, setHighlightedRegion] = useState(-1);
+  const [showAISegment, setShowAISegment] = useState(false);
+  const [apiKey, setApiKey] = useState('');
+  const [isDragging, setIsDragging] = useState(false);
 
   // Canvas refs
   const segmentationCanvasRef = useRef(null);
@@ -157,6 +160,16 @@ function App() {
     const pos = getCanvasMousePosition(segmentationCanvasRef.current, event);
     const regionIndex = findRegionAtPoint(pos.x, pos.y, regions);
 
+    // If dragging, select the region under the cursor
+    if (isDragging && regionIndex !== -1) {
+      const newRegions = [...regions];
+      if (!newRegions[regionIndex].selected) {
+        newRegions[regionIndex].selected = true;
+        setRegions(newRegions);
+        regionsRef.current = newRegions;
+      }
+    }
+
     setHighlightedRegion(regionIndex);
     drawSegmentation(
       originalImage,
@@ -165,7 +178,7 @@ function App() {
       regionIndex,
       cv
     );
-  }, [regions, originalImage, cv]);
+  }, [regions, originalImage, cv, isDragging]);
 
   /**
    * Handle mouse leaving the segmentation canvas
@@ -173,6 +186,7 @@ function App() {
   const handleCanvasMouseLeave = useCallback(() => {
     if (regions.length === 0 || !originalImage || !cv) return;
 
+    setIsDragging(false);
     setHighlightedRegion(-1);
     drawSegmentation(
       originalImage,
@@ -184,17 +198,20 @@ function App() {
   }, [regions, originalImage, cv]);
 
   /**
-   * Handle click on segmentation canvas to select/deselect regions
+   * Handle mouse down on segmentation canvas to start drag selection
    */
-  const handleCanvasClick = useCallback((event) => {
+  const handleCanvasMouseDown = useCallback((event) => {
     if (regions.length === 0 || !originalImage || !cv) return;
 
+    setIsDragging(true);
+
+    // Also select the region under the cursor immediately
     const pos = getCanvasMousePosition(segmentationCanvasRef.current, event);
     const regionIndex = findRegionAtPoint(pos.x, pos.y, regions);
 
     if (regionIndex !== -1) {
-      // Toggle selection
       const newRegions = [...regions];
+      // Toggle selection on mouse down
       newRegions[regionIndex].selected = !newRegions[regionIndex].selected;
       setRegions(newRegions);
       regionsRef.current = newRegions;
@@ -206,11 +223,20 @@ function App() {
         regionIndex,
         cv
       );
-
-      const selectedCount = newRegions.filter(r => r.selected).length;
-      setStatus({ message: `${selectedCount} region(s) selected`, type: 'info' });
     }
   }, [regions, originalImage, cv]);
+
+  /**
+   * Handle mouse up on segmentation canvas to end drag selection
+   */
+  const handleCanvasMouseUp = useCallback(() => {
+    if (!isDragging) return;
+
+    setIsDragging(false);
+
+    const selectedCount = regions.filter(r => r.selected).length;
+    setStatus({ message: `${selectedCount} region(s) selected`, type: 'info' });
+  }, [isDragging, regions]);
 
   /**
    * Clear all region selections
@@ -285,6 +311,132 @@ function App() {
       setStatus({ message: 'Error downloading mask: ' + error.message, type: 'error' });
     }
   }, []);
+
+  /**
+   * AI-based segmentation using Claude Vision API
+   */
+  const handleAISegment = useCallback(async () => {
+    if (!originalImage || !cv || !apiKey) {
+      setStatus({ message: 'Please provide an API key', type: 'error' });
+      return;
+    }
+
+    try {
+      setStatus({ message: 'Sending image to Claude API...', type: 'info' });
+
+      // Convert canvas to base64
+      const canvas = segmentationCanvasRef.current;
+      const imageData = canvas.toDataURL('image/jpeg', 0.8);
+      const base64Data = imageData.split(',')[1];
+
+      // Call Anthropic API
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 4096,
+          messages: [{
+            role: 'user',
+            content: [
+              {
+                type: 'image',
+                source: {
+                  type: 'base64',
+                  media_type: 'image/jpeg',
+                  data: base64Data
+                }
+              },
+              {
+                type: 'text',
+                text: `Analyze this image and identify distinct objects, text regions, and visual elements that someone might want to select. For each region, provide a bounding box.
+
+Return your response as a JSON array where each object has:
+- name: string (brief description)
+- box: [x, y, width, height] (coordinates in pixels, relative to image size ${canvas.width}x${canvas.height})
+
+Example format:
+[
+  {"name": "poster in top left", "box": [10, 20, 300, 400]},
+  {"name": "text saying hello", "box": [350, 50, 200, 80]}
+]
+
+Return ONLY the JSON array, no other text.`
+              }
+            ]
+          }]
+        })
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error?.message || 'API request failed');
+      }
+
+      const data = await response.json();
+      const content = data.content[0].text;
+
+      // Parse the JSON response
+      const jsonMatch = content.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) {
+        throw new Error('Could not parse AI response. Please try again.');
+      }
+
+      const aiRegions = JSON.parse(jsonMatch[0]);
+
+      // Convert AI regions to our region format
+      const newRegions = aiRegions.map((region, index) => {
+        const [x, y, width, height] = region.box;
+
+        // Create a rectangular contour
+        const contour = cv.matFromArray(4, 1, cv.CV_32SC2, [
+          x, y,
+          x + width, y,
+          x + width, y + height,
+          x, y + height
+        ]);
+
+        // Create a simple mask (we'll just use the bounding box)
+        const mask = cv.Mat.zeros(height, width, cv.CV_8U);
+        mask.setTo(new cv.Scalar(255));
+
+        return {
+          contour: contour,
+          mask: mask,
+          bounds: { x, y, width, height },
+          scaleFactor: 1, // No scaling for AI regions
+          selected: false,
+          name: region.name // Store the AI-provided name
+        };
+      });
+
+      setRegions(newRegions);
+      regionsRef.current = newRegions;
+
+      // Draw the regions
+      drawSegmentation(
+        originalImage,
+        newRegions,
+        segmentationCanvasRef.current,
+        -1,
+        cv
+      );
+
+      setStatus({
+        message: `AI found ${newRegions.length} regions! Hover to see names, click to select.`,
+        type: 'success'
+      });
+      setShowAISegment(false);
+
+    } catch (error) {
+      console.error('AI Segmentation error:', error);
+      setStatus({ message: 'AI Segmentation failed: ' + error.message, type: 'error' });
+    }
+  }, [originalImage, cv, apiKey]);
 
   // Cleanup OpenCV resources on unmount
   useEffect(() => {
@@ -381,6 +533,15 @@ function App() {
 
           <button
             className="btn btn-secondary"
+            onClick={() => setShowAISegment(true)}
+            disabled={!originalImage}
+            title="Use AI (Claude) to segment the image"
+          >
+            AI Segment (Beta)
+          </button>
+
+          <button
+            className="btn btn-secondary"
             onClick={handleClearSelection}
             disabled={regions.length === 0}
           >
@@ -419,7 +580,8 @@ function App() {
                 ref={segmentationCanvasRef}
                 onMouseMove={handleCanvasMouseMove}
                 onMouseLeave={handleCanvasMouseLeave}
-                onClick={handleCanvasClick}
+                onMouseDown={handleCanvasMouseDown}
+                onMouseUp={handleCanvasMouseUp}
               />
             </div>
           </div>
@@ -431,6 +593,47 @@ function App() {
             </div>
           </div>
         </div>
+
+        {/* AI Segmentation Modal */}
+        {showAISegment && (
+          <div className="modal-overlay" onClick={() => setShowAISegment(false)}>
+            <div className="modal" onClick={(e) => e.stopPropagation()}>
+              <h3>AI Segmentation (Beta)</h3>
+              <p>Use Claude's vision API to intelligently segment your image into objects and text regions.</p>
+
+              <div className="modal-content">
+                <label htmlFor="apiKey">Anthropic API Key:</label>
+                <input
+                  type="password"
+                  id="apiKey"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="sk-ant-..."
+                  className="api-key-input"
+                />
+                <p className="help-text">
+                  Get your API key from <a href="https://console.anthropic.com/" target="_blank" rel="noopener noreferrer">console.anthropic.com</a>
+                </p>
+                <p className="help-text">
+                  Your API key is stored locally and never saved on any server.
+                </p>
+              </div>
+
+              <div className="modal-buttons">
+                <button className="btn btn-secondary" onClick={() => setShowAISegment(false)}>
+                  Cancel
+                </button>
+                <button
+                  className="btn btn-primary"
+                  onClick={handleAISegment}
+                  disabled={!apiKey}
+                >
+                  Segment with AI
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

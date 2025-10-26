@@ -19,7 +19,8 @@ Image Mask Generator helps you highlight specific items on your wall using a pro
 ## Features
 
 ✅ **Fully Client-Side** - No backend, all processing happens in your browser
-✅ **Automatic Segmentation** - Uses OpenCV.js edge detection to find distinct regions
+✅ **Automatic Segmentation** - Uses OpenCV.js watershed algorithm to find distinct regions
+✅ **AI Segmentation (Beta)** - Use Claude's vision API for semantic object detection
 ✅ **Interactive Selection** - Hover to preview, click to select regions
 ✅ **Black & White Masks** - Generate projection-ready images
 ✅ **Adjustable Sensitivity** - Control how the image is segmented
@@ -89,8 +90,11 @@ npm run deploy
 
 - **[Testing Guide](docs/TESTING.md)** - Unit tests, integration tests, and manual testing procedures
 - **[Segmentation Algorithm](docs/SEGMENTATION_ALGORITHM.md)** - Technical deep-dive into the watershed algorithm
+- **[AI Segmentation Guide](docs/AI_SEGMENTATION.md)** - How to use Claude's vision API for intelligent segmentation
 
 ## How It Works
+
+### Watershed Segmentation (Default)
 
 The segmentation pipeline uses **watershed segmentation** for complete image coverage:
 1. Convert image to grayscale
