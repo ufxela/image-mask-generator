@@ -22,12 +22,18 @@ export function cleanupMats(...mats) {
  *
  * @param {cv.Mat} originalImage - The source image as OpenCV Mat
  * @param {number} sensitivity - Segmentation sensitivity (1-10, lower = fewer/larger regions)
+ * @param {number} regionSize - Target region size divisor (10-40, higher = smaller regions)
  * @param {object} cv - OpenCV.js instance
  * @returns {Array} Array of region objects with contour, mask, bounds, and selection state
  */
-export function segmentImage(originalImage, sensitivity, cv) {
+export function segmentImage(originalImage, sensitivity, regionSize, cv) {
   if (!originalImage || !cv) {
     throw new Error('Invalid image or OpenCV instance');
+  }
+
+  // Default regionSize to 20 if not provided (for backward compatibility)
+  if (regionSize === undefined || regionSize === null) {
+    regionSize = 20;
   }
 
   const regions = [];
@@ -68,23 +74,24 @@ export function segmentImage(originalImage, sensitivity, cv) {
       throw new Error(`cvtColor failed: ${e.message}`);
     }
 
-    // Step 2: Apply slight blur to reduce noise
-    console.log('[Segmentation] Step 2: Applying Gaussian blur');
+    // Step 2: Apply bilateral filter to reduce noise while preserving edges
+    // Bilateral filtering is better than Gaussian for preserving sharp edges
+    console.log('[Segmentation] Step 2: Applying bilateral filter to preserve edges');
     blurred = new cv.Mat();
-    cv.GaussianBlur(gray, blurred, new cv.Size(3, 3), 0);
+    cv.bilateralFilter(gray, blurred, 5, 75, 75);
 
-    // Step 3: Compute gradient magnitude (edge strength)
-    // This will guide watershed to follow edges
-    console.log('[Segmentation] Step 3: Computing gradient');
+    // Step 3: Compute gradient magnitude (edge strength) with larger kernel for better edge detection
+    // This will guide watershed to follow edges more accurately
+    console.log('[Segmentation] Step 3: Computing gradient with enhanced edge detection');
     gradX = new cv.Mat();
     gradY = new cv.Mat();
     gradient = new cv.Mat();
 
     try {
-      console.log('[Segmentation] Computing Sobel X');
-      cv.Sobel(blurred, gradX, cv.CV_32F, 1, 0, 3);
-      console.log('[Segmentation] Computing Sobel Y');
-      cv.Sobel(blurred, gradY, cv.CV_32F, 0, 1, 3);
+      console.log('[Segmentation] Computing Sobel X with kernel size 5');
+      cv.Sobel(blurred, gradX, cv.CV_32F, 1, 0, 5); // Larger kernel (5 instead of 3) for better edges
+      console.log('[Segmentation] Computing Sobel Y with kernel size 5');
+      cv.Sobel(blurred, gradY, cv.CV_32F, 0, 1, 5);
     } catch (e) {
       console.error('[Segmentation] Error in Sobel:', e);
       throw new Error(`Sobel failed: ${e.message}`);
@@ -114,9 +121,9 @@ export function segmentImage(originalImage, sensitivity, cv) {
 
     // Step 5: Create markers on a regular grid
     // Sensitivity controls marker spacing (lower = larger spacing = larger/fewer regions)
-    // Target: regions should be < 1/20th image dimensions, biased toward smaller
+    // regionSize parameter controls target region size (higher = smaller regions)
     console.log('[Segmentation] Step 5: Creating grid markers');
-    const maxRegionSize = Math.min(workingImage.cols, workingImage.rows) / 20;
+    const maxRegionSize = Math.min(workingImage.cols, workingImage.rows) / regionSize;
     const baseSpacing = maxRegionSize * 0.7; // Base spacing for medium-small regions
 
     // Sensitivity adjusts spacing: 1 (low) = larger spacing, 10 (high) = much smaller spacing
@@ -479,6 +486,84 @@ export function findRegionAtPoint(x, y, regions) {
     }
   }
   return -1;
+}
+
+/**
+ * Find all regions within a given radius of a point
+ * Useful for drag-selection with a "brush" radius
+ *
+ * @param {number} x - X coordinate (center)
+ * @param {number} y - Y coordinate (center)
+ * @param {number} radius - Radius in pixels
+ * @param {Array} regions - Array of region objects
+ * @returns {Array<number>} Array of region indices within the radius
+ */
+export function findRegionsInRadius(x, y, radius, regions) {
+  const foundRegions = [];
+
+  for (let i = 0; i < regions.length; i++) {
+    const region = regions[i];
+    const bounds = region.bounds;
+    const scaleFactor = region.scaleFactor || 1;
+
+    // Scale the coordinates to match the downscaled space
+    const scaledX = x * scaleFactor;
+    const scaledY = y * scaleFactor;
+    const scaledRadius = radius * scaleFactor;
+
+    // Check if the region's bounding box intersects with the circle
+    // Find the closest point on the bounding box to the circle center
+    const closestX = Math.max(bounds.x, Math.min(scaledX, bounds.x + bounds.width));
+    const closestY = Math.max(bounds.y, Math.min(scaledY, bounds.y + bounds.height));
+
+    // Calculate distance from circle center to this closest point
+    const distanceX = scaledX - closestX;
+    const distanceY = scaledY - closestY;
+    const distanceSquared = distanceX * distanceX + distanceY * distanceY;
+
+    // If the bounding box intersects the circle, check mask pixels
+    if (distanceSquared <= scaledRadius * scaledRadius) {
+      // Sample points around the center within the region to see if any are in the mask
+      let found = false;
+
+      // Check center point first
+      const localX = Math.floor(scaledX - bounds.x);
+      const localY = Math.floor(scaledY - bounds.y);
+
+      if (localX >= 0 && localX < region.mask.cols &&
+          localY >= 0 && localY < region.mask.rows) {
+        if (region.mask.ucharAt(localY, localX) > 0) {
+          found = true;
+        }
+      }
+
+      // If center isn't in mask, sample around the perimeter of the radius
+      if (!found) {
+        const samples = 8; // Sample 8 points around the circle
+        for (let angle = 0; angle < Math.PI * 2; angle += (Math.PI * 2) / samples) {
+          const sampleX = Math.floor(scaledX + Math.cos(angle) * scaledRadius * 0.5);
+          const sampleY = Math.floor(scaledY + Math.sin(angle) * scaledRadius * 0.5);
+
+          const sLocalX = Math.floor(sampleX - bounds.x);
+          const sLocalY = Math.floor(sampleY - bounds.y);
+
+          if (sLocalX >= 0 && sLocalX < region.mask.cols &&
+              sLocalY >= 0 && sLocalY < region.mask.rows) {
+            if (region.mask.ucharAt(sLocalY, sLocalX) > 0) {
+              found = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if (found) {
+        foundRegions.push(i);
+      }
+    }
+  }
+
+  return foundRegions;
 }
 
 /**

@@ -41,13 +41,13 @@ npm run dev
 ## How to Use
 
 1. **Upload Image**: Click "Choose Image" and select a photo (JPEG/PNG)
-2. **Adjust Sensitivity**: Use the slider (1-10) to control region detail
-   - Lower values = fewer, larger regions
-   - Higher values = more, smaller regions
+2. **Adjust Settings**: Use the sliders to control segmentation quality
+   - **Sensitivity** (1-10): Higher values = more regions, better edge detection
+   - **Region Size** (10-40): Higher values = smaller regions, more detail
+   - **Brush Size** (0-100px): Larger = select more regions at once when dragging
 3. **Segment**: Click "Segment Image" to divide into selectable regions
-4. **Select Regions**: Hover over regions to highlight, click to select/deselect
-5. **Create Mask**: Click "Create Mask" to generate the black-and-white image
-6. **Download**: Click "Download Mask" to save your projection mask
+4. **Select Regions**: Click and drag to paint-select regions - **the mask updates live!**
+5. **Download**: Click "Download Mask" to save your projection mask
 
 ## Technology
 

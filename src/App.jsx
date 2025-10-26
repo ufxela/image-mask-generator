@@ -4,6 +4,7 @@ import {
   segmentImage,
   drawSegmentation,
   findRegionAtPoint,
+  findRegionsInRadius,
   createMask,
   getCanvasMousePosition,
   cleanupMats
@@ -21,6 +22,8 @@ function App() {
   const [originalImage, setOriginalImage] = useState(null);
   const [regions, setRegions] = useState([]);
   const [sensitivity, setSensitivity] = useState(5);
+  const [regionSize, setRegionSize] = useState(20); // Default 20 = 1/20th of image
+  const [selectionRadius, setSelectionRadius] = useState(30); // Radius in pixels for drag selection
   const [status, setStatus] = useState({ message: '', type: 'info' });
   const [highlightedRegion, setHighlightedRegion] = useState(-1);
   const [showAISegment, setShowAISegment] = useState(false);
@@ -128,7 +131,7 @@ function App() {
     // Use setTimeout to allow UI to update
     setTimeout(() => {
       try {
-        const newRegions = segmentImage(originalImage, sensitivity, cv);
+        const newRegions = segmentImage(originalImage, sensitivity, regionSize, cv);
         setRegions(newRegions);
         regionsRef.current = newRegions;
 
@@ -141,7 +144,7 @@ function App() {
         );
 
         setStatus({
-          message: `Found ${newRegions.length} regions. Click regions to select them.`,
+          message: `Found ${newRegions.length} regions. Click and drag to select them.`,
           type: 'success'
         });
       } catch (error) {
@@ -149,7 +152,7 @@ function App() {
         setStatus({ message: 'Error during segmentation: ' + error.message, type: 'error' });
       }
     }, 100);
-  }, [originalImage, sensitivity, cv]);
+  }, [originalImage, sensitivity, regionSize, cv]);
 
   /**
    * Handle mouse movement over segmentation canvas
@@ -158,27 +161,54 @@ function App() {
     if (regions.length === 0 || !originalImage || !cv) return;
 
     const pos = getCanvasMousePosition(segmentationCanvasRef.current, event);
-    const regionIndex = findRegionAtPoint(pos.x, pos.y, regions);
 
-    // If dragging, select the region under the cursor
-    if (isDragging && regionIndex !== -1) {
-      const newRegions = [...regions];
-      if (!newRegions[regionIndex].selected) {
-        newRegions[regionIndex].selected = true;
-        setRegions(newRegions);
-        regionsRef.current = newRegions;
+    // If dragging, select all regions within the selection radius
+    if (isDragging) {
+      const regionIndices = findRegionsInRadius(pos.x, pos.y, selectionRadius, regions);
+
+      if (regionIndices.length > 0) {
+        const newRegions = [...regions];
+        let changed = false;
+
+        for (const idx of regionIndices) {
+          if (!newRegions[idx].selected) {
+            newRegions[idx].selected = true;
+            changed = true;
+          }
+        }
+
+        if (changed) {
+          setRegions(newRegions);
+          regionsRef.current = newRegions;
+
+          // Automatically update mask
+          createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+        }
       }
-    }
 
-    setHighlightedRegion(regionIndex);
-    drawSegmentation(
-      originalImage,
-      regions,
-      segmentationCanvasRef.current,
-      regionIndex,
-      cv
-    );
-  }, [regions, originalImage, cv, isDragging]);
+      // For highlighting during drag, just show the center point
+      const regionIndex = findRegionAtPoint(pos.x, pos.y, regions);
+      setHighlightedRegion(regionIndex);
+      drawSegmentation(
+        originalImage,
+        regions,
+        segmentationCanvasRef.current,
+        regionIndex,
+        cv
+      );
+    } else {
+      // When not dragging, just highlight the region under cursor
+      const regionIndex = findRegionAtPoint(pos.x, pos.y, regions);
+      setHighlightedRegion(regionIndex);
+      drawSegmentation(
+        originalImage,
+        regions,
+        segmentationCanvasRef.current,
+        regionIndex,
+        cv
+      );
+    }
+  }, [regions, originalImage, cv, isDragging, selectionRadius]);
 
   /**
    * Handle mouse leaving the segmentation canvas
@@ -223,6 +253,9 @@ function App() {
         regionIndex,
         cv
       );
+
+      // Automatically update mask
+      createMask(originalImage, newRegions, maskCanvasRef.current, cv);
     }
   }, [regions, originalImage, cv]);
 
@@ -252,42 +285,16 @@ function App() {
       -1,
       cv
     );
+
+    // Clear the mask canvas
+    const maskCanvas = maskCanvasRef.current;
+    const ctx = maskCanvas.getContext('2d');
+    ctx.fillStyle = 'black';
+    ctx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
+
     setStatus({ message: 'Selection cleared.', type: 'info' });
   }, [regions, originalImage, cv]);
 
-  /**
-   * Generate mask from selected regions
-   */
-  const handleCreateMask = useCallback(() => {
-    if (!originalImage || !cv) {
-      setStatus({ message: 'Please upload an image first.', type: 'error' });
-      return;
-    }
-
-    if (regions.length === 0) {
-      setStatus({ message: 'Please segment the image first.', type: 'error' });
-      return;
-    }
-
-    const selectedCount = regions.filter(r => r.selected).length;
-    if (selectedCount === 0) {
-      setStatus({ message: 'Please select at least one region.', type: 'warning' });
-      return;
-    }
-
-    try {
-      const success = createMask(originalImage, regions, maskCanvasRef.current, cv);
-      if (success) {
-        setStatus({
-          message: `Mask created successfully with ${selectedCount} selected region(s)!`,
-          type: 'success'
-        });
-      }
-    } catch (error) {
-      console.error('Error creating mask:', error);
-      setStatus({ message: 'Error creating mask: ' + error.message, type: 'error' });
-    }
-  }, [originalImage, regions, cv]);
 
   /**
    * Download the generated mask
@@ -490,11 +497,16 @@ Return ONLY the JSON array, no other text.`
           <h3>How to Use:</h3>
           <ul>
             <li><strong>Upload Image:</strong> Click "Choose Image" to upload a photo of your wall/collage</li>
-            <li><strong>Adjust Sensitivity:</strong> Use the slider to control segmentation detail (lower = fewer, larger regions)</li>
+            <li><strong>Adjust Settings:</strong> Use the sliders to control segmentation:
+              <ul>
+                <li><strong>Sensitivity</strong> (1-10): Higher = more regions, better edge detection</li>
+                <li><strong>Region Size</strong> (10-40): Higher = smaller regions, more detail</li>
+                <li><strong>Brush Size</strong> (0-100px): Larger = select more regions at once when dragging</li>
+              </ul>
+            </li>
             <li><strong>Segment:</strong> Click "Segment Image" to divide the image into selectable regions</li>
-            <li><strong>Select Regions:</strong> Hover over regions to highlight them, click to select/deselect</li>
-            <li><strong>Generate Mask:</strong> Click "Create Mask" to generate the black-and-white projection mask</li>
-            <li><strong>Download:</strong> Click "Download Mask" to save the mask image</li>
+            <li><strong>Select Regions:</strong> Click and drag to paint-select regions (mask updates live on the right!)</li>
+            <li><strong>Download:</strong> Click "Download Mask" to save your projection mask</li>
           </ul>
         </div>
 
@@ -519,8 +531,39 @@ Return ONLY the JSON array, no other text.`
               value={sensitivity}
               onChange={(e) => setSensitivity(parseInt(e.target.value))}
               disabled={!originalImage}
+              title="Lower = fewer/larger regions, Higher = more/smaller regions"
             />
             <span className="value">{sensitivity}</span>
+          </div>
+
+          <div className="slider-group">
+            <label htmlFor="regionSizeSlider">Region Size:</label>
+            <input
+              type="range"
+              id="regionSizeSlider"
+              min="10"
+              max="40"
+              value={regionSize}
+              onChange={(e) => setRegionSize(parseInt(e.target.value))}
+              disabled={!originalImage}
+              title="Lower = larger regions, Higher = smaller regions"
+            />
+            <span className="value">{regionSize}</span>
+          </div>
+
+          <div className="slider-group">
+            <label htmlFor="selectionRadiusSlider">Brush Size:</label>
+            <input
+              type="range"
+              id="selectionRadiusSlider"
+              min="0"
+              max="100"
+              value={selectionRadius}
+              onChange={(e) => setSelectionRadius(parseInt(e.target.value))}
+              disabled={regions.length === 0}
+              title="Selection radius for drag painting (0 = single region, 100 = large brush)"
+            />
+            <span className="value">{selectionRadius}px</span>
           </div>
 
           <button
@@ -546,14 +589,6 @@ Return ONLY the JSON array, no other text.`
             disabled={regions.length === 0}
           >
             Clear Selection
-          </button>
-
-          <button
-            className="btn btn-success"
-            onClick={handleCreateMask}
-            disabled={regions.length === 0}
-          >
-            Create Mask
           </button>
 
           <button
@@ -587,7 +622,7 @@ Return ONLY the JSON array, no other text.`
           </div>
 
           <div className="canvas-container">
-            <h3>Generated Mask (White = Selected)</h3>
+            <h3>Live Mask Preview (White = Selected)</h3>
             <div className="canvas-wrapper">
               <canvas id="maskCanvas" ref={maskCanvasRef} />
             </div>
