@@ -282,14 +282,83 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
 
     console.log(`[Segmentation] Found ${regionPoints.size} regions from watershed`);
 
+    // Step 7.5: Redistribute pixels from small regions to ensure complete coverage
+    console.log('[Segmentation] Step 7.5: Redistributing pixels from small regions to ensure 100% coverage');
+
+    // Identify small regions that will be filtered out
+    const smallRegions = [];
+    const largeRegions = [];
+
+    for (const [label, points] of regionPoints.entries()) {
+      if (points.length < minArea) {
+        smallRegions.push({ label, points });
+      } else {
+        largeRegions.push({ label, points });
+      }
+    }
+
+    console.log(`[Segmentation] Found ${smallRegions.length} small regions to redistribute (${largeRegions.length} large regions)`);
+
+    // Redistribute pixels from small regions to nearest large region
+    for (const smallRegion of smallRegions) {
+      for (const pixel of smallRegion.points) {
+        // Find nearest large region by checking neighbors
+        let nearestLabel = null;
+        let searchRadius = 1;
+        const maxSearchRadius = 50; // Maximum search distance
+
+        // Expand search radius until we find a large region
+        while (nearestLabel === null && searchRadius <= maxSearchRadius) {
+          for (let dy = -searchRadius; dy <= searchRadius; dy++) {
+            for (let dx = -searchRadius; dx <= searchRadius; dx++) {
+              if (dx === 0 && dy === 0) continue;
+
+              const nx = pixel.x + dx;
+              const ny = pixel.y + dy;
+
+              if (nx >= 0 && nx < markers.cols && ny >= 0 && ny < markers.rows) {
+                const neighborLabel = markers.intPtr(ny, nx)[0];
+
+                // Check if this neighbor belongs to a large region
+                if (neighborLabel > 0) {
+                  const neighborRegion = regionPoints.get(neighborLabel);
+                  if (neighborRegion && neighborRegion.length >= minArea) {
+                    nearestLabel = neighborLabel;
+                    break;
+                  }
+                }
+              }
+            }
+            if (nearestLabel !== null) break;
+          }
+          searchRadius++;
+        }
+
+        // Add pixel to nearest large region
+        if (nearestLabel !== null) {
+          regionPoints.get(nearestLabel).push({ x: pixel.x, y: pixel.y });
+        } else if (largeRegions.length > 0) {
+          // Fallback: add to first large region if no neighbor found
+          const firstLargeLabel = largeRegions[0].label;
+          regionPoints.get(firstLargeLabel).push({ x: pixel.x, y: pixel.y });
+        }
+      }
+
+      // Remove the small region from the map
+      regionPoints.delete(smallRegion.label);
+    }
+
+    console.log(`[Segmentation] After redistribution: ${regionPoints.size} regions remaining`);
+
     // Step 8: Create masks and contours only for regions that meet minimum area
     console.log('[Segmentation] Step 8: Creating masks and contours for valid regions');
 
     let processedCount = 0;
     for (const [label, points] of regionPoints.entries()) {
       try {
-        // Skip regions that are too small
+        // At this point, all regions should be large enough (small ones were redistributed)
         if (points.length < minArea) {
+          console.warn(`[Segmentation] WARNING: Found small region after redistribution (${points.length} < ${minArea})`);
           processedCount++;
           continue;
         }
@@ -349,7 +418,9 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
 
           const area = cv.contourArea(contour);
 
-          if (area > minArea) {
+          // Since we already redistributed small regions, we should keep this one
+          // Only skip if contour extraction genuinely failed
+          if (area > 0) {
             // Translate contour coordinates back to image space
             const translatedContour = new cv.Mat(contour.rows, 1, cv.CV_32SC2);
             for (let i = 0; i < contour.rows; i++) {
@@ -368,6 +439,8 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
             });
 
             // Don't delete translatedContour - it's now owned by the region!
+          } else {
+            console.warn(`[Segmentation] Skipping region ${label} with zero contour area`);
           }
         }
 
