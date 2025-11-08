@@ -33,13 +33,26 @@ function App() {
   const [cocoModel, setCocoModel] = useState(null);
   const [loadingAI, setLoadingAI] = useState(false);
 
+  // Presenter mode state
+  const [presenterMode, setPresenterMode] = useState(false);
+  const [presenterSubMode, setPresenterSubMode] = useState('segment'); // 'segment' | 'brush-white' | 'brush-black' | 'eraser'
+  const [brushStrokes, setBrushStrokes] = useState([]); // Array of {type: 'white'|'black', points: [{x, y}], size: number}
+  const [currentStroke, setCurrentStroke] = useState(null);
+  const [brushSize, setBrushSize] = useState(20);
+  const [presenterIsDragging, setPresenterIsDragging] = useState(false);
+  const [showDownloadModal, setShowDownloadModal] = useState(false);
+  const [finalPresenterImage, setFinalPresenterImage] = useState(null);
+
   // Canvas refs
   const segmentationCanvasRef = useRef(null);
   const maskCanvasRef = useRef(null);
+  const presenterCanvasRef = useRef(null);
+  const presenterContainerRef = useRef(null);
 
   // Refs for cleanup to avoid stale closures
   const originalImageRef = useRef(null);
   const regionsRef = useRef([]);
+  const brushStrokesRef = useRef([]);
 
   /**
    * Load image into OpenCV and set up canvases
@@ -415,6 +428,196 @@ function App() {
   }, []);
 
   /**
+   * Download the presenter mode image
+   */
+  const handleDownloadPresenterImage = useCallback(() => {
+    if (!finalPresenterImage) return;
+
+    try {
+      const a = document.createElement('a');
+      a.href = finalPresenterImage;
+      a.download = 'presenter-mask.png';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      setStatus({ message: 'Presenter mask downloaded successfully!', type: 'success' });
+      setShowDownloadModal(false);
+      setFinalPresenterImage(null);
+    } catch (error) {
+      console.error('Error downloading presenter image:', error);
+      setStatus({ message: 'Error downloading image: ' + error.message, type: 'error' });
+    }
+  }, [finalPresenterImage]);
+
+  /**
+   * Enter presenter mode (full screen)
+   */
+  const enterPresenterMode = useCallback(() => {
+    if (regions.length === 0) {
+      setStatus({ message: 'Please segment the image first.', type: 'error' });
+      return;
+    }
+
+    setPresenterMode(true);
+    setPresenterSubMode('segment');
+    setBrushStrokes([]);
+    brushStrokesRef.current = [];
+
+    // Request fullscreen on the container
+    setTimeout(() => {
+      if (presenterContainerRef.current) {
+        if (presenterContainerRef.current.requestFullscreen) {
+          presenterContainerRef.current.requestFullscreen();
+        } else if (presenterContainerRef.current.webkitRequestFullscreen) {
+          presenterContainerRef.current.webkitRequestFullscreen();
+        } else if (presenterContainerRef.current.mozRequestFullScreen) {
+          presenterContainerRef.current.mozRequestFullScreen();
+        }
+      }
+    }, 100);
+  }, [regions]);
+
+  /**
+   * Exit presenter mode
+   */
+  const exitPresenterMode = useCallback(() => {
+    // Capture the final canvas as an image before exiting
+    if (presenterCanvasRef.current) {
+      try {
+        const dataURL = presenterCanvasRef.current.toDataURL('image/png');
+        setFinalPresenterImage(dataURL);
+        setShowDownloadModal(true);
+      } catch (error) {
+        console.error('Error capturing presenter canvas:', error);
+      }
+    }
+
+    setPresenterMode(false);
+    setPresenterSubMode('segment');
+    setPresenterIsDragging(false);
+    setCurrentStroke(null);
+
+    // Exit fullscreen
+    if (document.fullscreenElement) {
+      document.exitFullscreen();
+    } else if (document.webkitFullscreenElement) {
+      document.webkitExitFullscreen();
+    } else if (document.mozFullScreenElement) {
+      document.mozCancelFullScreen();
+    }
+  }, []);
+
+  /**
+   * Render the presenter mode canvas with segments + brush overlay
+   */
+  const renderPresenterCanvas = useCallback(() => {
+    if (!presenterCanvasRef.current || !originalImage || !cv) return;
+
+    const canvas = presenterCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+
+    // Set canvas to full window size
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    // Fill with black background
+    ctx.fillStyle = 'black';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Calculate scaling to fit the mask in the canvas while maintaining aspect ratio
+    const imageAspect = originalImage.cols / originalImage.rows;
+    const canvasAspect = canvas.width / canvas.height;
+
+    let displayWidth, displayHeight, offsetX, offsetY;
+
+    if (imageAspect > canvasAspect) {
+      // Image is wider than canvas
+      displayWidth = canvas.width;
+      displayHeight = canvas.width / imageAspect;
+      offsetX = 0;
+      offsetY = (canvas.height - displayHeight) / 2;
+    } else {
+      // Image is taller than canvas
+      displayHeight = canvas.height;
+      displayWidth = canvas.height * imageAspect;
+      offsetX = (canvas.width - displayWidth) / 2;
+      offsetY = 0;
+    }
+
+    // Create the mask from selected regions
+    const mask = cv.Mat.zeros(originalImage.rows, originalImage.cols, cv.CV_8UC1);
+    const selectedRegions = regions.filter(r => r.selected);
+
+    for (let region of selectedRegions) {
+      const scaleFactor = region.scaleFactor || 1;
+      const scale = 1 / scaleFactor;
+
+      // Create scaled contour
+      const scaledContour = new cv.Mat(region.contour.rows, 1, cv.CV_32SC2);
+      for (let i = 0; i < region.contour.rows; i++) {
+        scaledContour.data32S[i * 2] = Math.round(region.contour.data32S[i * 2] * scale);
+        scaledContour.data32S[i * 2 + 1] = Math.round(region.contour.data32S[i * 2 + 1] * scale);
+      }
+
+      const contourVec = new cv.MatVector();
+      contourVec.push_back(scaledContour);
+      cv.drawContours(mask, contourVec, 0, new cv.Scalar(255), -1);
+      contourVec.delete();
+      scaledContour.delete();
+    }
+
+    // Convert mask to ImageData
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = mask.cols;
+    tempCanvas.height = mask.rows;
+    cv.imshow(tempCanvas, mask);
+    mask.delete();
+
+    // Draw the mask scaled to fit
+    ctx.drawImage(tempCanvas, offsetX, offsetY, displayWidth, displayHeight);
+
+    // Apply brush strokes overlay
+    if (brushStrokes.length > 0 || currentStroke) {
+      const allStrokes = currentStroke ? [...brushStrokes, currentStroke] : brushStrokes;
+
+      for (const stroke of allStrokes) {
+        ctx.strokeStyle = stroke.type === 'white' ? 'white' : 'black';
+        ctx.fillStyle = stroke.type === 'white' ? 'white' : 'black';
+        const strokeSize = stroke.size || brushSize; // Use stroke's stored size, or current brushSize for in-progress strokes
+        ctx.lineWidth = strokeSize;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        if (stroke.points.length === 1) {
+          // Single point - draw a circle
+          const point = stroke.points[0];
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, strokeSize / 2, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (stroke.points.length > 1) {
+          // Multiple points - draw a path
+          ctx.beginPath();
+          ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+          for (let i = 1; i < stroke.points.length; i++) {
+            ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+          }
+          ctx.stroke();
+
+          // Also draw circles at each point for smoother appearance
+          for (const point of stroke.points) {
+            ctx.beginPath();
+            ctx.arc(point.x, point.y, strokeSize / 2, 0, Math.PI * 2);
+            ctx.fill();
+          }
+        }
+      }
+    }
+
+    return { displayWidth, displayHeight, offsetX, offsetY };
+  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize]);
+
+  /**
    * AI-based segmentation using TensorFlow.js COCO-SSD
    */
   const handleAISegment = useCallback(async () => {
@@ -522,6 +725,237 @@ function App() {
       });
     };
   }, []);
+
+  // Presenter mode: Keyboard event handler
+  useEffect(() => {
+    if (!presenterMode) return;
+
+    const handleKeyDown = (e) => {
+      switch (e.key.toLowerCase()) {
+        case 'escape':
+          exitPresenterMode();
+          break;
+        case 's':
+          setPresenterSubMode('segment');
+          break;
+        case 'b':
+          setPresenterSubMode('brush-black');
+          break;
+        case 'w':
+          setPresenterSubMode('brush-white');
+          break;
+        case 'e':
+          setPresenterSubMode('eraser');
+          break;
+        case 'z':
+          // Decrease brush size
+          setBrushSize(prev => Math.max(5, prev - 5));
+          break;
+        case 'x':
+          // Increase brush size
+          setBrushSize(prev => Math.min(100, prev + 5));
+          break;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [presenterMode, exitPresenterMode]);
+
+  // Presenter mode: Render canvas when state changes
+  useEffect(() => {
+    if (presenterMode) {
+      renderPresenterCanvas();
+    }
+  }, [presenterMode, regions, brushStrokes, currentStroke, renderPresenterCanvas]);
+
+  // Presenter mode: Handle window resize
+  useEffect(() => {
+    if (!presenterMode) return;
+
+    const handleResize = () => {
+      renderPresenterCanvas();
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [presenterMode, renderPresenterCanvas]);
+
+  /**
+   * Presenter mode: Handle mouse down
+   */
+  const handlePresenterMouseDown = useCallback((event) => {
+    if (!presenterMode || !originalImage || !cv) return;
+
+    setPresenterIsDragging(true);
+
+    const canvas = presenterCanvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+
+    if (presenterSubMode === 'segment') {
+      // Convert screen coordinates to image coordinates
+      const imageAspect = originalImage.cols / originalImage.rows;
+      const canvasAspect = canvas.width / canvas.height;
+
+      let displayWidth, displayHeight, offsetX, offsetY;
+
+      if (imageAspect > canvasAspect) {
+        displayWidth = canvas.width;
+        displayHeight = canvas.width / imageAspect;
+        offsetX = 0;
+        offsetY = (canvas.height - displayHeight) / 2;
+      } else {
+        displayHeight = canvas.height;
+        displayWidth = canvas.height * imageAspect;
+        offsetX = (canvas.width - displayWidth) / 2;
+        offsetY = 0;
+      }
+
+      // Check if click is within the displayed image bounds
+      if (x < offsetX || x > offsetX + displayWidth || y < offsetY || y > offsetY + displayHeight) {
+        return;
+      }
+
+      // Convert to image coordinates
+      const imgX = ((x - offsetX) / displayWidth) * originalImage.cols;
+      const imgY = ((y - offsetY) / displayHeight) * originalImage.rows;
+
+      // Find region at this point
+      const regionIndex = findRegionAtPoint(imgX, imgY, regions);
+
+      if (regionIndex !== -1) {
+        const newRegions = [...regions];
+        newRegions[regionIndex].selected = !newRegions[regionIndex].selected;
+        setRegions(newRegions);
+        regionsRef.current = newRegions;
+
+        // Update the regular mask canvas too
+        createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+      }
+    } else if (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black') {
+      // Start a new brush stroke with current brush size
+      const strokeType = presenterSubMode === 'brush-white' ? 'white' : 'black';
+      setCurrentStroke({ type: strokeType, points: [{ x, y }], size: brushSize });
+    } else if (presenterSubMode === 'eraser') {
+      // Start erasing - we'll remove strokes that intersect
+      // Store current brush size for eraser radius
+      setCurrentStroke({ type: 'erase', points: [{ x, y }], size: brushSize });
+    }
+  }, [presenterMode, presenterSubMode, originalImage, regions, cv, brushSize]);
+
+  /**
+   * Presenter mode: Handle mouse move
+   */
+  const handlePresenterMouseMove = useCallback((event) => {
+    if (!presenterMode || !presenterIsDragging) return;
+
+    const canvas = presenterCanvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+
+    if (presenterSubMode === 'segment') {
+      // Similar to mouse down - toggle regions as we drag
+      const imageAspect = originalImage.cols / originalImage.rows;
+      const canvasAspect = canvas.width / canvas.height;
+
+      let displayWidth, displayHeight, offsetX, offsetY;
+
+      if (imageAspect > canvasAspect) {
+        displayWidth = canvas.width;
+        displayHeight = canvas.width / imageAspect;
+        offsetX = 0;
+        offsetY = (canvas.height - displayHeight) / 2;
+      } else {
+        displayHeight = canvas.height;
+        displayWidth = canvas.height * imageAspect;
+        offsetX = (canvas.width - displayWidth) / 2;
+        offsetY = 0;
+      }
+
+      if (x < offsetX || x > offsetX + displayWidth || y < offsetY || y > offsetY + displayHeight) {
+        return;
+      }
+
+      const imgX = ((x - offsetX) / displayWidth) * originalImage.cols;
+      const imgY = ((y - offsetY) / displayHeight) * originalImage.rows;
+
+      const regionIndex = findRegionAtPoint(imgX, imgY, regions);
+
+      if (regionIndex !== -1 && !regions[regionIndex].selected) {
+        const newRegions = [...regions];
+        newRegions[regionIndex].selected = true;
+        setRegions(newRegions);
+        regionsRef.current = newRegions;
+        createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+      }
+    } else if (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black') {
+      // Continue the brush stroke
+      if (currentStroke) {
+        setCurrentStroke({
+          ...currentStroke,
+          points: [...currentStroke.points, { x, y }]
+        });
+      }
+    } else if (presenterSubMode === 'eraser') {
+      // Continue eraser path
+      if (currentStroke) {
+        setCurrentStroke({
+          ...currentStroke,
+          points: [...currentStroke.points, { x, y }]
+        });
+      }
+    }
+  }, [presenterMode, presenterIsDragging, presenterSubMode, currentStroke, originalImage, regions, cv]);
+
+  /**
+   * Presenter mode: Handle mouse up
+   */
+  const handlePresenterMouseUp = useCallback(() => {
+    if (!presenterMode) return;
+
+    setPresenterIsDragging(false);
+
+    if (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black') {
+      // Finalize the brush stroke
+      if (currentStroke && currentStroke.points.length > 0) {
+        const newStrokes = [...brushStrokes, currentStroke];
+        setBrushStrokes(newStrokes);
+        brushStrokesRef.current = newStrokes;
+        setCurrentStroke(null);
+      }
+    } else if (presenterSubMode === 'eraser') {
+      // Erase strokes that intersect with the eraser path
+      if (currentStroke && currentStroke.points.length > 0) {
+        const eraserPoints = currentStroke.points;
+        const eraserRadius = currentStroke.size / 2; // Use the eraser's stored size
+
+        // Filter out strokes that intersect with eraser
+        const newStrokes = brushStrokes.filter(stroke => {
+          const strokeRadius = stroke.size / 2;
+          // Check if any point in the stroke intersects with any eraser point
+          for (const strokePoint of stroke.points) {
+            for (const eraserPoint of eraserPoints) {
+              const dx = strokePoint.x - eraserPoint.x;
+              const dy = strokePoint.y - eraserPoint.y;
+              const distance = Math.sqrt(dx * dx + dy * dy);
+
+              if (distance < eraserRadius + strokeRadius) {
+                return false; // Remove this stroke
+              }
+            }
+          }
+          return true; // Keep this stroke
+        });
+
+        setBrushStrokes(newStrokes);
+        brushStrokesRef.current = newStrokes;
+        setCurrentStroke(null);
+      }
+    }
+  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes]);
 
   // Show loading state while OpenCV loads
   if (cvLoading) {
@@ -661,6 +1095,15 @@ function App() {
           >
             Download Mask
           </button>
+
+          <button
+            className="btn btn-primary"
+            onClick={enterPresenterMode}
+            disabled={regions.length === 0}
+            title="Enter full-screen presenter mode (Esc to exit)"
+          >
+            Presenter Mode
+          </button>
         </div>
 
         {status.message && (
@@ -726,6 +1169,172 @@ function App() {
                   disabled={loadingAI}
                 >
                   {loadingAI ? 'Loading...' : 'Detect Objects'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Presenter Mode */}
+        {presenterMode && (
+          <div
+            ref={presenterContainerRef}
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              width: '100vw',
+              height: '100vh',
+              backgroundColor: 'black',
+              zIndex: 9999,
+              cursor: presenterSubMode === 'segment' ? 'pointer' : 'crosshair'
+            }}
+          >
+            <canvas
+              ref={presenterCanvasRef}
+              onMouseDown={handlePresenterMouseDown}
+              onMouseMove={handlePresenterMouseMove}
+              onMouseUp={handlePresenterMouseUp}
+              onMouseLeave={handlePresenterMouseUp}
+              style={{
+                display: 'block',
+                width: '100%',
+                height: '100%'
+              }}
+            />
+
+            {/* Mode indicator */}
+            <div style={{
+              position: 'absolute',
+              top: '20px',
+              left: '20px',
+              backgroundColor: 'rgba(0, 0, 0, 0.7)',
+              color: 'white',
+              padding: '15px 20px',
+              borderRadius: '8px',
+              fontFamily: 'monospace',
+              fontSize: '14px',
+              zIndex: 10000
+            }}>
+              <div style={{ marginBottom: '8px', fontWeight: 'bold', fontSize: '16px' }}>
+                Presenter Mode
+              </div>
+              <div style={{ marginBottom: '4px' }}>
+                <strong>Mode:</strong> {
+                  presenterSubMode === 'segment' ? 'Segment Selection' :
+                  presenterSubMode === 'brush-white' ? 'White Brush' :
+                  presenterSubMode === 'brush-black' ? 'Black Brush' :
+                  'Eraser'
+                }
+              </div>
+              <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid rgba(255,255,255,0.3)' }}>
+                <div><kbd>S</kbd> Segment Mode</div>
+                <div><kbd>W</kbd> White Brush</div>
+                <div><kbd>B</kbd> Black Brush</div>
+                <div><kbd>E</kbd> Eraser</div>
+                <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)' }}>
+                  <kbd>Z</kbd> Smaller Brush
+                </div>
+                <div><kbd>X</kbd> Larger Brush</div>
+                <div style={{ marginTop: '8px' }}><kbd>ESC</kbd> Exit</div>
+              </div>
+            </div>
+
+            {/* Brush size indicator */}
+            {(presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black' || presenterSubMode === 'eraser') && (
+              <div style={{
+                position: 'absolute',
+                top: '20px',
+                right: '20px',
+                backgroundColor: 'rgba(0, 0, 0, 0.7)',
+                color: 'white',
+                padding: '15px 20px',
+                borderRadius: '8px',
+                fontFamily: 'monospace',
+                fontSize: '14px',
+                zIndex: 10000
+              }}>
+                <div><strong>Brush Size:</strong> {brushSize}px</div>
+                <div style={{ marginTop: '8px' }}>
+                  <button
+                    onClick={() => setBrushSize(Math.max(5, brushSize - 5))}
+                    style={{
+                      padding: '4px 8px',
+                      marginRight: '4px',
+                      backgroundColor: '#444',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '4px',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    -
+                  </button>
+                  <button
+                    onClick={() => setBrushSize(Math.min(100, brushSize + 5))}
+                    style={{
+                      padding: '4px 8px',
+                      backgroundColor: '#444',
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '4px',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Download Modal after exiting presenter mode */}
+        {showDownloadModal && finalPresenterImage && (
+          <div className="modal-overlay" onClick={() => { setShowDownloadModal(false); setFinalPresenterImage(null); }}>
+            <div className="modal" onClick={(e) => e.stopPropagation()}>
+              <h3>Download Presenter Mask</h3>
+              <p>Your presenter mask is ready! Preview below and download when ready.</p>
+
+              <div className="modal-content">
+                <div style={{
+                  maxHeight: '400px',
+                  overflow: 'auto',
+                  backgroundColor: '#000',
+                  borderRadius: '4px',
+                  padding: '10px',
+                  marginBottom: '15px'
+                }}>
+                  <img
+                    src={finalPresenterImage}
+                    alt="Presenter mask preview"
+                    style={{
+                      width: '100%',
+                      height: 'auto',
+                      display: 'block'
+                    }}
+                  />
+                </div>
+                <p className="help-text">
+                  This image includes your selected segments plus any brush strokes you added in presenter mode.
+                </p>
+              </div>
+
+              <div className="modal-buttons">
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => {
+                    setShowDownloadModal(false);
+                    setFinalPresenterImage(null);
+                  }}
+                >
+                  Close
+                </button>
+                <button
+                  className="btn btn-success"
+                  onClick={handleDownloadPresenterImage}
+                >
+                  Download Image
                 </button>
               </div>
             </div>
