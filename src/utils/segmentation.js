@@ -187,7 +187,10 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
 
     try {
       // First pass: collect pixel coordinates for each region
+      // Also assign boundary pixels (-1) and background (0) to nearest region for complete coverage
       const chunkSize = 100; // Process 100 rows at a time
+      const boundaryPixels = []; // Store boundary pixels to assign later
+
       for (let startY = 0; startY < markers.rows; startY += chunkSize) {
         const endY = Math.min(startY + chunkSize, markers.rows);
 
@@ -208,11 +211,15 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
               throw new Error(`Invalid marker label at (${y}, ${x}): ${label}`);
             }
 
-            if (label > 0) { // Valid region (not boundary or background)
+            if (label > 0) {
+              // Valid region (not boundary or background)
               if (!regionPoints.has(label)) {
                 regionPoints.set(label, []);
               }
               regionPoints.get(label).push({ x, y });
+            } else if (label === -1 || label === 0) {
+              // Boundary or background - save to assign to nearest region later
+              boundaryPixels.push({ x, y });
             }
           }
         }
@@ -220,6 +227,47 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
         // Log progress for large images
         if (markers.rows > 1000 && (startY % 500 === 0)) {
           console.log(`[Segmentation] Progress: ${Math.floor((startY / markers.rows) * 100)}%`);
+        }
+      }
+
+      // Second pass: assign boundary/background pixels to nearest region
+      console.log(`[Segmentation] Assigning ${boundaryPixels.length} boundary/background pixels to nearest regions...`);
+      for (const pixel of boundaryPixels) {
+        let nearestLabel = null;
+        let minDist = Infinity;
+
+        // Check neighboring pixels (8-connected) to find nearest region
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+
+            const nx = pixel.x + dx;
+            const ny = pixel.y + dy;
+
+            if (nx >= 0 && nx < markers.cols && ny >= 0 && ny < markers.rows) {
+              const neighborLabel = markers.intPtr(ny, nx)[0];
+              if (neighborLabel > 0) {
+                // Found a neighbor with a valid region
+                const dist = Math.abs(dx) + Math.abs(dy); // Manhattan distance
+                if (dist < minDist) {
+                  minDist = dist;
+                  nearestLabel = neighborLabel;
+                }
+              }
+            }
+          }
+        }
+
+        // Assign to nearest region (or first available region if no neighbors)
+        if (nearestLabel !== null) {
+          if (!regionPoints.has(nearestLabel)) {
+            regionPoints.set(nearestLabel, []);
+          }
+          regionPoints.get(nearestLabel).push({ x: pixel.x, y: pixel.y });
+        } else if (regionPoints.size > 0) {
+          // No neighbors found, assign to first region as fallback
+          const firstLabel = regionPoints.keys().next().value;
+          regionPoints.get(firstLabel).push({ x: pixel.x, y: pixel.y });
         }
       }
     } catch (e) {

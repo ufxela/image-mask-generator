@@ -9,6 +9,8 @@ import {
   getCanvasMousePosition,
   cleanupMats
 } from './utils/segmentation';
+import * as cocoSsd from '@tensorflow-models/coco-ssd';
+import '@tensorflow/tfjs';
 import './App.css';
 
 /**
@@ -27,8 +29,9 @@ function App() {
   const [status, setStatus] = useState({ message: '', type: 'info' });
   const [highlightedRegion, setHighlightedRegion] = useState(-1);
   const [showAISegment, setShowAISegment] = useState(false);
-  const [apiKey, setApiKey] = useState('');
   const [isDragging, setIsDragging] = useState(false);
+  const [cocoModel, setCocoModel] = useState(null);
+  const [loadingAI, setLoadingAI] = useState(false);
 
   // Canvas refs
   const segmentationCanvasRef = useRef(null);
@@ -128,10 +131,96 @@ function App() {
 
     setStatus({ message: 'Segmenting image... This may take a few seconds.', type: 'info' });
 
+    // Save current selection mask if there are selected regions
+    let savedSelectionMask = null;
+    const selectedRegions = regions.filter(r => r.selected);
+
+    if (selectedRegions.length > 0) {
+      console.log('[Segmentation] Preserving selection from', selectedRegions.length, 'regions');
+      // Create a mask of currently selected regions to preserve
+      savedSelectionMask = cv.Mat.zeros(originalImage.rows, originalImage.cols, cv.CV_8U);
+      createMask(originalImage, regions, {
+        width: originalImage.cols,
+        height: originalImage.rows,
+        getContext: () => ({
+          // Mock context - we'll use cv.imshow alternative
+          fillStyle: '',
+          fillRect: () => {}
+        })
+      }, cv);
+
+      // Actually create the mask properly
+      for (let region of selectedRegions) {
+        const scaleFactor = region.scaleFactor || 1;
+        const scale = 1 / scaleFactor;
+
+        // Create scaled contour
+        const scaledContour = new cv.Mat(region.contour.rows, 1, cv.CV_32SC2);
+        for (let i = 0; i < region.contour.rows; i++) {
+          scaledContour.data32S[i * 2] = Math.round(region.contour.data32S[i * 2] * scale);
+          scaledContour.data32S[i * 2 + 1] = Math.round(region.contour.data32S[i * 2 + 1] * scale);
+        }
+
+        const contourVec = new cv.MatVector();
+        contourVec.push_back(scaledContour);
+        cv.drawContours(savedSelectionMask, contourVec, 0, new cv.Scalar(255), -1);
+        contourVec.delete();
+        scaledContour.delete();
+      }
+    }
+
     // Use setTimeout to allow UI to update
     setTimeout(() => {
       try {
         const newRegions = segmentImage(originalImage, sensitivity, regionSize, cv);
+
+        // If we have a saved selection, mark overlapping regions as selected
+        if (savedSelectionMask) {
+          console.log('[Segmentation] Restoring selection to new regions...');
+          let restoredCount = 0;
+
+          for (let i = 0; i < newRegions.length; i++) {
+            const region = newRegions[i];
+            const scaleFactor = region.scaleFactor || 1;
+            const scale = 1 / scaleFactor;
+
+            // Check if this region overlaps with the saved selection
+            // Sample several points in the region's mask
+            let overlapCount = 0;
+            let totalSamples = 0;
+
+            // Sample points from the region's mask
+            const sampleStep = Math.max(1, Math.floor(region.mask.rows / 10));
+            for (let y = 0; y < region.mask.rows; y += sampleStep) {
+              for (let x = 0; x < region.mask.cols; x += sampleStep) {
+                if (region.mask.ucharAt(y, x) > 0) {
+                  totalSamples++;
+
+                  // Transform to original image coordinates
+                  const origX = Math.floor((region.bounds.x + x) * scale);
+                  const origY = Math.floor((region.bounds.y + y) * scale);
+
+                  if (origX >= 0 && origX < savedSelectionMask.cols &&
+                      origY >= 0 && origY < savedSelectionMask.rows) {
+                    if (savedSelectionMask.ucharAt(origY, origX) > 0) {
+                      overlapCount++;
+                    }
+                  }
+                }
+              }
+            }
+
+            // If more than 50% of sampled points overlap, mark as selected
+            if (totalSamples > 0 && (overlapCount / totalSamples) > 0.5) {
+              newRegions[i].selected = true;
+              restoredCount++;
+            }
+          }
+
+          console.log('[Segmentation] Restored selection to', restoredCount, 'new regions');
+          savedSelectionMask.delete();
+        }
+
         setRegions(newRegions);
         regionsRef.current = newRegions;
 
@@ -143,8 +232,14 @@ function App() {
           cv
         );
 
+        // Update mask with restored selection
+        if (newRegions.some(r => r.selected)) {
+          createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+        }
+
+        const selectedCount = newRegions.filter(r => r.selected).length;
         setStatus({
-          message: `Found ${newRegions.length} regions. Click and drag to select them.`,
+          message: `Found ${newRegions.length} regions${selectedCount > 0 ? `, restored ${selectedCount} selected` : ''}. Click and drag to select them.`,
           type: 'success'
         });
       } catch (error) {
@@ -152,7 +247,7 @@ function App() {
         setStatus({ message: 'Error during segmentation: ' + error.message, type: 'error' });
       }
     }, 100);
-  }, [originalImage, sensitivity, regionSize, cv]);
+  }, [originalImage, sensitivity, regionSize, cv, regions]);
 
   /**
    * Handle mouse movement over segmentation canvas
@@ -320,104 +415,70 @@ function App() {
   }, []);
 
   /**
-   * AI-based segmentation using Claude Vision API
+   * AI-based segmentation using TensorFlow.js COCO-SSD
    */
   const handleAISegment = useCallback(async () => {
-    if (!originalImage || !cv || !apiKey) {
-      setStatus({ message: 'Please provide an API key', type: 'error' });
+    if (!originalImage || !cv) {
+      setStatus({ message: 'Please upload an image first', type: 'error' });
       return;
     }
 
     try {
-      setStatus({ message: 'Sending image to Claude API...', type: 'info' });
+      setLoadingAI(true);
+      setStatus({ message: 'Loading AI model... (first time may take a moment)', type: 'info' });
 
-      // Convert canvas to base64
+      // Load COCO-SSD model if not already loaded
+      let model = cocoModel;
+      if (!model) {
+        model = await cocoSsd.load();
+        setCocoModel(model);
+      }
+
+      setStatus({ message: 'Detecting objects in image...', type: 'info' });
+
+      // Get image from canvas
       const canvas = segmentationCanvasRef.current;
-      const imageData = canvas.toDataURL('image/jpeg', 0.8);
-      const base64Data = imageData.split(',')[1];
 
-      // Call Anthropic API
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01'
-        },
-        body: JSON.stringify({
-          model: 'claude-3-5-sonnet-20241022',
-          max_tokens: 4096,
-          messages: [{
-            role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: 'image/jpeg',
-                  data: base64Data
-                }
-              },
-              {
-                type: 'text',
-                text: `Analyze this image and identify distinct objects, text regions, and visual elements that someone might want to select. For each region, provide a bounding box.
+      // Run object detection
+      const predictions = await model.detect(canvas);
 
-Return your response as a JSON array where each object has:
-- name: string (brief description)
-- box: [x, y, width, height] (coordinates in pixels, relative to image size ${canvas.width}x${canvas.height})
-
-Example format:
-[
-  {"name": "poster in top left", "box": [10, 20, 300, 400]},
-  {"name": "text saying hello", "box": [350, 50, 200, 80]}
-]
-
-Return ONLY the JSON array, no other text.`
-              }
-            ]
-          }]
-        })
-      });
-
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.error?.message || 'API request failed');
+      if (predictions.length === 0) {
+        setStatus({ message: 'No objects detected. Try watershed segmentation instead.', type: 'warning' });
+        setShowAISegment(false);
+        setLoadingAI(false);
+        return;
       }
 
-      const data = await response.json();
-      const content = data.content[0].text;
+      console.log('[AI Segmentation] Detected', predictions.length, 'objects:', predictions);
 
-      // Parse the JSON response
-      const jsonMatch = content.match(/\[[\s\S]*\]/);
-      if (!jsonMatch) {
-        throw new Error('Could not parse AI response. Please try again.');
-      }
-
-      const aiRegions = JSON.parse(jsonMatch[0]);
-
-      // Convert AI regions to our region format
-      const newRegions = aiRegions.map((region, index) => {
-        const [x, y, width, height] = region.box;
+      // Convert predictions to our region format
+      const newRegions = predictions.map((prediction, index) => {
+        const [x, y, width, height] = prediction.bbox;
 
         // Create a rectangular contour
         const contour = cv.matFromArray(4, 1, cv.CV_32SC2, [
-          x, y,
-          x + width, y,
-          x + width, y + height,
-          x, y + height
+          Math.floor(x), Math.floor(y),
+          Math.floor(x + width), Math.floor(y),
+          Math.floor(x + width), Math.floor(y + height),
+          Math.floor(x), Math.floor(y + height)
         ]);
 
-        // Create a simple mask (we'll just use the bounding box)
-        const mask = cv.Mat.zeros(height, width, cv.CV_8U);
+        // Create a simple mask (filled rectangle)
+        const mask = cv.Mat.zeros(Math.floor(height), Math.floor(width), cv.CV_8U);
         mask.setTo(new cv.Scalar(255));
 
         return {
           contour: contour,
           mask: mask,
-          bounds: { x, y, width, height },
+          bounds: {
+            x: Math.floor(x),
+            y: Math.floor(y),
+            width: Math.floor(width),
+            height: Math.floor(height)
+          },
           scaleFactor: 1, // No scaling for AI regions
           selected: false,
-          name: region.name // Store the AI-provided name
+          name: `${prediction.class} (${Math.round(prediction.score * 100)}%)` // Store detected class and confidence
         };
       });
 
@@ -434,16 +495,18 @@ Return ONLY the JSON array, no other text.`
       );
 
       setStatus({
-        message: `AI found ${newRegions.length} regions! Hover to see names, click to select.`,
+        message: `AI detected ${newRegions.length} objects! Click to select regions.`,
         type: 'success'
       });
       setShowAISegment(false);
+      setLoadingAI(false);
 
     } catch (error) {
       console.error('AI Segmentation error:', error);
       setStatus({ message: 'AI Segmentation failed: ' + error.message, type: 'error' });
+      setLoadingAI(false);
     }
-  }, [originalImage, cv, apiKey]);
+  }, [originalImage, cv, cocoModel]);
 
   // Cleanup OpenCV resources on unmount
   useEffect(() => {
@@ -578,9 +641,9 @@ Return ONLY the JSON array, no other text.`
             className="btn btn-secondary"
             onClick={() => setShowAISegment(true)}
             disabled={!originalImage}
-            title="Use AI (Claude) to segment the image"
+            title="Use AI to detect objects (free, runs in browser)"
           >
-            AI Segment (Beta)
+            AI Object Detection
           </button>
 
           <button
@@ -633,24 +696,23 @@ Return ONLY the JSON array, no other text.`
         {showAISegment && (
           <div className="modal-overlay" onClick={() => setShowAISegment(false)}>
             <div className="modal" onClick={(e) => e.stopPropagation()}>
-              <h3>AI Segmentation (Beta)</h3>
-              <p>Use Claude's vision API to intelligently segment your image into objects and text regions.</p>
+              <h3>AI Object Detection</h3>
+              <p>Use TensorFlow.js COCO-SSD to automatically detect common objects in your image.</p>
 
               <div className="modal-content">
-                <label htmlFor="apiKey">Anthropic API Key:</label>
-                <input
-                  type="password"
-                  id="apiKey"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="sk-ant-..."
-                  className="api-key-input"
-                />
                 <p className="help-text">
-                  Get your API key from <a href="https://console.anthropic.com/" target="_blank" rel="noopener noreferrer">console.anthropic.com</a>
+                  <strong>How it works:</strong>
                 </p>
+                <ul style={{textAlign: 'left', marginLeft: '20px'}}>
+                  <li>Completely free - no API key required</li>
+                  <li>Runs entirely in your browser (client-side)</li>
+                  <li>Works offline after first model load</li>
+                  <li>Detects 80+ common object types (people, furniture, animals, vehicles, etc.)</li>
+                  <li>First use may take a moment to download the model (~5MB)</li>
+                </ul>
                 <p className="help-text">
-                  Your API key is stored locally and never saved on any server.
+                  <strong>Note:</strong> AI detection works best on photos with clear, distinct objects.
+                  For abstract patterns or precise edge-following, use watershed segmentation instead.
                 </p>
               </div>
 
@@ -661,9 +723,9 @@ Return ONLY the JSON array, no other text.`
                 <button
                   className="btn btn-primary"
                   onClick={handleAISegment}
-                  disabled={!apiKey}
+                  disabled={loadingAI}
                 >
-                  Segment with AI
+                  {loadingAI ? 'Loading...' : 'Detect Objects'}
                 </button>
               </div>
             </div>

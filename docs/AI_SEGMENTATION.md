@@ -1,77 +1,76 @@
-# AI Segmentation (Beta)
+# AI Object Detection
 
 ## Overview
 
-The AI Segmentation feature uses Claude's vision API to intelligently identify and segment objects, text, and visual elements in your image. This provides a complementary approach to the watershed algorithm, with better semantic understanding.
+The AI Object Detection feature uses TensorFlow.js and the COCO-SSD model to automatically identify and segment common objects in your image. This provides a complementary approach to the watershed algorithm, with semantic understanding of what objects are in the image.
 
 ## How It Works
 
 1. **Upload Your Image** - Load an image as usual
-2. **Click "AI Segment (Beta)"** - Opens the AI segmentation modal
-3. **Enter API Key** - Provide your Anthropic API key (required)
-4. **Segment** - Claude analyzes the image and returns bounding boxes for detected regions
-5. **Select & Export** - Use the same UI to select regions and create masks
+2. **Click "AI Object Detection"** - Opens the AI detection modal
+3. **Detect Objects** - TensorFlow.js loads the model (first time only) and detects objects
+4. **Select & Export** - Use the same UI to select detected regions and create masks
 
-## Getting an API Key
+## No API Key Required!
 
-1. Visit [console.anthropic.com](https://console.anthropic.com/)
-2. Sign up or log in
-3. Navigate to API Keys
-4. Create a new key
-5. Copy and paste it into the modal
+Unlike the previous version that used Claude's API, this implementation is:
+- ✅ **Completely Free** - No API key, no costs, no account needed
+- ✅ **Client-Side** - Runs entirely in your browser using WebAssembly
+- ✅ **Works Offline** - After the first model download, works without internet
+- ✅ **Privacy-Preserving** - Your images never leave your device
 
-**Note:** Your API key is stored only in your browser's memory and is never sent to any server except Anthropic's API.
+## How COCO-SSD Works
 
-## How Claude Segments Images
+COCO-SSD (Common Objects in Context - Single Shot MultiBox Detector) is a pre-trained deep learning model that:
 
-The AI segmentation sends your image to Claude with this prompt:
+1. **Analyzes Your Image** - Processes the canvas directly in your browser
+2. **Detects Objects** - Identifies 80+ common object types from the COCO dataset
+3. **Returns Bounding Boxes** - Provides coordinates `[x, y, width, height]` for each detected object
+4. **Includes Confidence Scores** - Each detection has a confidence percentage (e.g., "person (95%)")
 
-```
-Analyze this image and identify distinct objects, text regions,
-and visual elements that someone might want to select.
-
-For each region, provide a bounding box with:
-- name: brief description
-- box: [x, y, width, height] coordinates
-```
-
-Claude returns a JSON array of detected regions, which are then converted to the same format as watershed regions and displayed in the UI.
+The model can detect: people, animals, vehicles, furniture, electronics, food items, sports equipment, and much more.
 
 ## Advantages vs Watershed
 
-**AI Segmentation (Claude):**
-- ✅ **Semantic Understanding** - Recognizes objects, text, people, etc.
-- ✅ **Better for Text** - Detects entire words, sentences, or text blocks
-- ✅ **Object-Aware** - Groups related elements (e.g., "poster with red border")
-- ✅ **Hierarchical** - Can identify both large objects and small details
-- ❌ **Requires API Key** - Not fully client-side
-- ❌ **API Costs** - ~$0.003 per image (claude-3-5-sonnet)
-- ❌ **Internet Required** - Must be online
-- ❌ **Bounding Boxes** - Currently returns rectangles, not pixel-perfect masks
+**AI Object Detection (COCO-SSD):**
+- ✅ **Semantic Understanding** - Recognizes 80+ common object types
+- ✅ **Object-Aware** - Identifies whole objects (people, chairs, cups, etc.)
+- ✅ **Confidence Scores** - Shows how certain the model is about each detection
+- ✅ **Fully Client-Side** - No API needed, runs in your browser
+- ✅ **Free Forever** - No costs whatsoever
+- ✅ **Works Offline** - After initial model download
+- ✅ **Privacy** - Images never leave your device
+- ❌ **Bounding Boxes Only** - Returns rectangles, not pixel-perfect masks
+- ❌ **Limited to COCO Classes** - Only detects trained object types
+- ❌ **Poor for Abstract Patterns** - Needs recognizable objects
 
 **Watershed Segmentation:**
 - ✅ **Fully Client-Side** - No API needed
 - ✅ **Free** - No costs
 - ✅ **Offline** - Works without internet
 - ✅ **Pixel-Perfect** - Follows exact edges
+- ✅ **Universal** - Works on any image (patterns, textures, etc.)
+- ✅ **Complete Coverage** - Every pixel belongs to a region
 - ❌ **No Semantic Understanding** - Doesn't know what objects are
-- ❌ **Poor for Text** - Splits letters/words into many regions
 - ❌ **Uniform Regions** - Creates blob-like shapes
 
 ## Current Limitations
 
 1. **Bounding Boxes Only** - AI regions are rectangular, not contoured
-   - Future: Could use Claude's regions as seeds for watershed refinement
+   - Future: Could use COCO-SSD detections as seeds for watershed refinement
 
-2. **API Rate Limits** - Anthropic has rate limits on API calls
-   - If you hit limits, wait a moment and try again
+2. **COCO Dataset Only** - Limited to 80 object classes from the COCO dataset
+   - Detects common objects but may miss domain-specific items
+   - See [COCO classes](https://github.com/tensorflow/tfjs-models/tree/master/coco-ssd#what-objects-can-the-model-detect) for full list
 
-3. **Image Size** - Large images may exceed API limits
-   - Currently sends the full canvas (up to ~10MB after JPEG compression)
-   - May need to downsample very large images
+3. **Model Size** - First load downloads ~5MB model
+   - Subsequent loads use cached model (works offline)
+   - May take 5-10 seconds on first use
 
-4. **Parse Errors** - Claude occasionally returns non-JSON responses
-   - The code extracts JSON from the response, but edge cases may fail
+4. **Performance** - Inference speed depends on your device
+   - Modern computers: 1-3 seconds per image
+   - Older devices may take longer
+   - Uses WebGL for GPU acceleration when available
 
 ## Future Improvements
 
@@ -81,128 +80,158 @@ Combine both methods:
 2. Use watershed to refine boundaries
 3. Best of both worlds!
 
-### Polygon Support
-- Ask Claude to return polygon vertices instead of bounding boxes
-- Would require more complex prompt engineering
+### Polygon/Mask Support
+- Use segmentation models instead of detection (e.g., DeepLab)
+- Generate pixel-perfect masks for detected objects
+- Combine with watershed for edge refinement
 
 ### Smart Region Merging
-- Detect overlapping AI regions
+- Detect overlapping detections
 - Merge or split as needed
+- Handle nested objects (e.g., cup on table)
 
-### Cost Optimization
-- Downsample images before sending to API
-- Cache results for repeated segmentation
-- Batch multiple requests
+### Performance Optimization
+- Model quantization for faster inference
+- WebWorker support for non-blocking UI
+- Progressive detection (show results as they come)
+- Image downsampling for very large images
 
 ## Example Use Cases
 
-**Best for AI Segmentation:**
-- Photos with distinct objects (books, posters, people)
-- Images with text you want to select (signs, labels, captions)
-- Collages where you want to select whole items
-- Mixed media (photos + text + graphics)
+**Best for AI Object Detection:**
+- Photos with distinct, recognizable objects (books, chairs, people, animals)
+- Collages where you want to select whole items quickly
+- Images with common household items or furniture
+- Photos where you want to select "all people" or "all cups"
 
 **Best for Watershed:**
 - Abstract patterns or textures
 - Images where you want precise edge following
-- When you don't have an API key
-- When you need completely client-side processing
+- Posters, artwork, or non-standard objects not in COCO dataset
+- When you need complete coverage of all image regions
 
 ## Privacy & Security
 
-**Your API Key:**
-- Stored only in browser memory (state variable)
-- Not persisted to localStorage or cookies
-- Lost when you refresh the page
-- Never sent anywhere except Anthropic's API
+**Complete Privacy:**
+- Everything runs in your browser - no servers involved
+- Your images NEVER leave your device
+- No tracking, no analytics, no data collection
+- Model is downloaded from TensorFlow.js CDN (only on first use)
+- After first load, works completely offline
 
-**Your Images:**
-- Converted to JPEG and sent to Anthropic's API
-- Subject to [Anthropic's Privacy Policy](https://www.anthropic.com/privacy)
-- Not used for model training (as of their current policy)
-- Consider sensitivity before uploading private images
-
-## API Costs
-
-Using Claude 3.5 Sonnet (as of October 2024):
-- ~1,000 tokens per image (depending on size/quality)
-- Input: $3 per million tokens
-- **Estimated cost: ~$0.003 per image**
-
-For a typical user segmenting 10-20 images: **$0.03-$0.06 total**
+**Zero Cost:**
+- No API keys required
+- No subscriptions or accounts needed
+- Completely free forever
+- No hidden costs or usage limits
 
 ## Troubleshooting
 
-**"API request failed"**
-- Check your API key is correct
-- Ensure you have credits in your Anthropic account
-- Check console for detailed error message
+**"No objects detected"**
+- Image may not contain recognizable COCO objects
+- Try watershed segmentation instead
+- Common with abstract patterns, artwork, or unusual objects
 
-**"Could not parse AI response"**
-- Claude occasionally returns explanatory text instead of JSON
-- Try again - usually works on retry
-- Report persistent issues with example images
+**"Loading AI model... taking too long"**
+- First load downloads ~5MB model - may take time on slow connections
+- Check browser console for errors
+- Ensure WebGL is enabled in your browser
+- Try refreshing the page
 
-**"Too many requests"**
-- You've hit Anthropic's rate limit
-- Wait 1 minute and try again
-- Consider upgrading your API tier
+**Model loads slowly or inference is slow**
+- Older devices may take longer (10-20 seconds)
+- First inference is slowest (model initialization)
+- Subsequent detections on same page session are faster
+- Close other tabs to free up memory
 
-**Regions look wrong**
-- AI segmentation is best-effort
-- Different images work better/worse
-- Try watershed segmentation as alternative
-- Or manually select multiple AI regions to build desired shape
+**Detections are inaccurate or missing objects**
+- COCO-SSD is trained on specific object types
+- May not detect custom/unusual items
+- Overlapping objects may be detected as one bounding box
+- Try adjusting image orientation or cropping
+- Use watershed segmentation for non-standard objects
+
+**WebGL errors**
+- TensorFlow.js uses WebGL for acceleration
+- Ensure WebGL is enabled in browser settings
+- Update graphics drivers if needed
+- May fall back to CPU (slower but works)
 
 ## Code Structure
 
-**API Call** (`App.jsx:handleAISegment`)
+**Model Loading** (`App.jsx:handleAISegment`)
 ```javascript
-// Convert canvas to base64
-const imageData = canvas.toDataURL('image/jpeg', 0.8);
+// Load COCO-SSD model (cached after first load)
+let model = cocoModel;
+if (!model) {
+  model = await cocoSsd.load();
+  setCocoModel(model);
+}
+```
 
-// Send to Anthropic API
-const response = await fetch('https://api.anthropic.com/v1/messages', {
-  headers: { 'x-api-key': apiKey },
-  body: JSON.stringify({
-    model: 'claude-3-5-sonnet-20241022',
-    messages: [{ role: 'user', content: [image, prompt] }]
-  })
-});
+**Object Detection**
+```javascript
+// Detect objects directly from canvas
+const predictions = await model.detect(canvas);
+
+// Each prediction has:
+// - bbox: [x, y, width, height]
+// - class: "person", "chair", etc.
+// - score: confidence (0-1)
 ```
 
 **Region Creation**
 ```javascript
-// Convert AI bounding boxes to region objects
-const regions = aiRegions.map(region => ({
-  contour: createRectangularContour(region.box),
-  mask: createRectangularMask(region.box),
-  bounds: region.box,
-  name: region.name
+// Convert predictions to region objects
+const regions = predictions.map(prediction => ({
+  contour: createRectangularContour(prediction.bbox),
+  mask: createRectangularMask(prediction.bbox),
+  bounds: { x, y, width, height },
+  name: `${prediction.class} (${Math.round(prediction.score * 100)}%)`
 }));
 ```
 
 **Display**
 - Uses same `drawSegmentation()` function as watershed
 - Regions are compatible with selection/mask creation
-- Only difference: `name` property for hover tooltips (future feature)
+- Region names show object class and confidence score
 
 ## Roadmap
 
-- [ ] Display region names on hover
-- [ ] Hybrid segmentation (AI + watershed refinement)
-- [ ] Polygon support (not just bounding boxes)
-- [ ] Support for other LLMs (GPT-4V, Gemini Vision)
-- [ ] Prompt customization (let users specify what to detect)
-- [ ] Region confidence scores
-- [ ] Hierarchical region tree (objects within objects)
+- [ ] Display region names on hover (already stored, just need UI)
+- [ ] Hybrid segmentation (use COCO-SSD regions as seeds for watershed refinement)
+- [ ] Polygon support using TensorFlow.js segmentation models
+- [ ] Support for additional models:
+  - [ ] MobileNet for faster detection on mobile devices
+  - [ ] DeepLab for semantic segmentation (pixel-perfect masks)
+  - [ ] PoseNet for detecting people/poses
+- [ ] Confidence threshold slider (filter low-confidence detections)
+- [ ] Custom class filtering (e.g., "only detect people")
+
+## Detected Object Classes
+
+COCO-SSD can detect 80 object classes including:
+
+**People:** person
+**Vehicles:** bicycle, car, motorcycle, airplane, bus, train, truck, boat
+**Animals:** bird, cat, dog, horse, sheep, cow, elephant, bear, zebra, giraffe
+**Accessories:** backpack, umbrella, handbag, tie, suitcase
+**Sports:** frisbee, skis, snowboard, sports ball, kite, baseball bat, skateboard, surfboard, tennis racket
+**Kitchen:** bottle, wine glass, cup, fork, knife, spoon, bowl
+**Food:** banana, apple, sandwich, orange, broccoli, carrot, hot dog, pizza, donut, cake
+**Furniture:** chair, couch, potted plant, bed, dining table, toilet
+**Electronics:** tv, laptop, mouse, remote, keyboard, cell phone
+**Appliances:** microwave, oven, toaster, sink, refrigerator
+**Indoor:** book, clock, vase, scissors, teddy bear, hair drier, toothbrush
+
+See [full COCO dataset](http://cocodataset.org/#explore) for details.
 
 ## Feedback
 
-This is a **beta feature**! Please report:
-- Images that segment poorly
-- API errors or edge cases
+Please report:
+- Images where detection fails or is inaccurate
+- Performance issues or slow loading
 - Feature requests
-- Cost concerns
+- Browser compatibility issues
 
 Open an issue at: https://github.com/ufxela/image-mask-generator/issues

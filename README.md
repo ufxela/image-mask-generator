@@ -20,7 +20,7 @@ Image Mask Generator helps you highlight specific items on your wall using a pro
 
 ✅ **Fully Client-Side** - No backend, all processing happens in your browser
 ✅ **Automatic Segmentation** - Uses OpenCV.js watershed algorithm to find distinct regions
-✅ **AI Segmentation (Beta)** - Use Claude's vision API for semantic object detection
+✅ **AI Object Detection** - Free, client-side object detection using TensorFlow.js COCO-SSD (no API key!)
 ✅ **Interactive Selection** - Hover to preview, click to select regions
 ✅ **Black & White Masks** - Generate projection-ready images
 ✅ **Adjustable Sensitivity** - Control how the image is segmented
@@ -53,7 +53,9 @@ npm run dev
 
 - **React** - UI framework
 - **Vite** - Build tool and dev server
-- **OpenCV.js** - Computer vision (edge detection, contours)
+- **OpenCV.js** - Computer vision (edge detection, watershed algorithm)
+- **TensorFlow.js** - Machine learning framework for AI object detection
+- **COCO-SSD** - Pre-trained object detection model (80+ object types)
 - **HTML5 Canvas** - Image rendering
 - **GitHub Actions** - Automated deployment
 - **GitHub Pages** - Free hosting
