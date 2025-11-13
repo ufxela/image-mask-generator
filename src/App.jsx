@@ -9,6 +9,12 @@ import {
   getCanvasMousePosition,
   cleanupMats
 } from './utils/segmentation';
+import {
+  computeHomography,
+  invertHomography,
+  applyHomography,
+  warpImage
+} from './utils/homography';
 import * as cocoSsd from '@tensorflow-models/coco-ssd';
 import '@tensorflow/tfjs';
 import './App.css';
@@ -43,6 +49,11 @@ function App() {
   const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [finalPresenterImage, setFinalPresenterImage] = useState(null);
 
+  // Transform mode state
+  const [transformMode, setTransformMode] = useState(false);
+  const [transformPoints, setTransformPoints] = useState([]); // Array of {x, y, type: 'source'|'dest'}
+  const [homographyMatrix, setHomographyMatrix] = useState(null); // 3x3 matrix
+
   // Canvas refs
   const segmentationCanvasRef = useRef(null);
   const maskCanvasRef = useRef(null);
@@ -53,6 +64,11 @@ function App() {
   const originalImageRef = useRef(null);
   const regionsRef = useRef([]);
   const brushStrokesRef = useRef([]);
+
+  // Store base/untransformed state for reset
+  const baseImageRef = useRef(null);
+  const baseRegionsRef = useRef([]);
+  const baseBrushStrokesRef = useRef([]);
 
   /**
    * Load image into OpenCV and set up canvases
@@ -525,6 +541,56 @@ function App() {
     ctx.fillStyle = 'black';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+    // If in transform mode, show the original color image instead of the mask
+    if (transformMode) {
+      const imageAspect = originalImage.cols / originalImage.rows;
+      const canvasAspect = canvas.width / canvas.height;
+
+      let displayWidth, displayHeight, offsetX, offsetY;
+
+      if (imageAspect > canvasAspect) {
+        displayWidth = canvas.width;
+        displayHeight = canvas.width / imageAspect;
+        offsetX = 0;
+        offsetY = (canvas.height - displayHeight) / 2;
+      } else {
+        displayHeight = canvas.height;
+        displayWidth = canvas.height * imageAspect;
+        offsetX = (canvas.width - displayWidth) / 2;
+        offsetY = 0;
+      }
+
+      // Convert OpenCV Mat to canvas image
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = originalImage.cols;
+      tempCanvas.height = originalImage.rows;
+      cv.imshow(tempCanvas, originalImage);
+
+      // Draw the original image
+      ctx.drawImage(tempCanvas, offsetX, offsetY, displayWidth, displayHeight);
+
+      // Draw transform points
+      for (let i = 0; i < transformPoints.length; i++) {
+        const point = transformPoints[i];
+        const isSource = point.type === 'source';
+
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, 4, 0, Math.PI * 2);
+        ctx.fillStyle = isSource ? 'red' : 'lime';
+        ctx.fill();
+        ctx.strokeStyle = 'white';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+
+        // Add number label
+        ctx.fillStyle = 'white';
+        ctx.font = 'bold 10px monospace';
+        ctx.fillText(String(Math.floor(i / 2) + 1), point.x - 3, point.y + 3);
+      }
+
+      return { displayWidth, displayHeight, offsetX, offsetY };
+    }
+
     // Calculate scaling to fit the mask in the canvas while maintaining aspect ratio
     const imageAspect = originalImage.cols / originalImage.rows;
     const canvasAspect = canvas.width / canvas.height;
@@ -615,7 +681,338 @@ function App() {
     }
 
     return { displayWidth, displayHeight, offsetX, offsetY };
-  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize]);
+  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize, transformMode, transformPoints, homographyMatrix]);
+
+  /**
+   * Save the current state as the base (untransformed) state
+   */
+  const saveBaseState = useCallback(() => {
+    if (!originalImage || !cv) return;
+
+    console.log('[Transform] Saving base state for reset');
+
+    // Save a clone of the original image
+    if (baseImageRef.current) {
+      cleanupMats(baseImageRef.current);
+    }
+    baseImageRef.current = originalImage.clone();
+
+    // Save a deep copy of regions (clone contours and masks)
+    const baseRegions = regions.map(region => {
+      const clonedContour = region.contour.clone();
+      const clonedMask = region.mask.clone();
+
+      return {
+        ...region,
+        contour: clonedContour,
+        mask: clonedMask
+      };
+    });
+
+    // Clean up old base regions
+    baseRegionsRef.current.forEach(region => {
+      if (region.contour && !region.contour.isDeleted()) {
+        region.contour.delete();
+      }
+      if (region.mask && !region.mask.isDeleted()) {
+        region.mask.delete();
+      }
+    });
+
+    baseRegionsRef.current = baseRegions;
+
+    // Save brush strokes (deep copy)
+    baseBrushStrokesRef.current = JSON.parse(JSON.stringify(brushStrokes));
+
+  }, [originalImage, regions, brushStrokes, cv]);
+
+  /**
+   * Restore the base (untransformed) state
+   */
+  const restoreBaseState = useCallback(() => {
+    if (!baseImageRef.current || !cv) {
+      console.log('[Transform] No base state to restore');
+      return;
+    }
+
+    try {
+      console.log('[Transform] Restoring base state');
+
+      // Clean up current image
+      if (originalImageRef.current) {
+        cleanupMats(originalImageRef.current);
+      }
+
+      // Restore image
+      const restoredImage = baseImageRef.current.clone();
+      setOriginalImage(restoredImage);
+      originalImageRef.current = restoredImage;
+
+      // Restore regions (clone from base)
+      const restoredRegions = baseRegionsRef.current.map(region => {
+        const clonedContour = region.contour.clone();
+        const clonedMask = region.mask.clone();
+
+        return {
+          ...region,
+          contour: clonedContour,
+          mask: clonedMask
+        };
+      });
+
+      // Clean up old regions
+      regionsRef.current.forEach(region => {
+        if (region.contour && !region.contour.isDeleted()) {
+          region.contour.delete();
+        }
+        if (region.mask && !region.mask.isDeleted()) {
+          region.mask.delete();
+        }
+      });
+
+      setRegions(restoredRegions);
+      regionsRef.current = restoredRegions;
+
+      // Restore brush strokes
+      const restoredStrokes = JSON.parse(JSON.stringify(baseBrushStrokesRef.current));
+      setBrushStrokes(restoredStrokes);
+      brushStrokesRef.current = restoredStrokes;
+
+      // Update canvases
+      const segCanvas = segmentationCanvasRef.current;
+      cv.imshow(segCanvas, restoredImage);
+      drawSegmentation(restoredImage, restoredRegions, segCanvas, -1, cv);
+      createMask(restoredImage, restoredRegions, maskCanvasRef.current, cv);
+
+      console.log('[Transform] Base state restored');
+
+    } catch (error) {
+      console.error('[Transform] Error restoring base state:', error);
+    }
+  }, [cv]);
+
+  /**
+   * Update the base state with new values (e.g., after applying a transformation)
+   * This allows the user to make changes after a transformation and have those
+   * changes become the new baseline for future transformations
+   */
+  const updateBaseState = useCallback((newImage, newRegions, newBrushStrokes) => {
+    if (!cv) return;
+
+    console.log('[Transform] Updating base state with new transformed values');
+
+    try {
+      // Clean up old base image
+      if (baseImageRef.current) {
+        cleanupMats(baseImageRef.current);
+      }
+
+      // Save new base image
+      baseImageRef.current = newImage.clone();
+
+      // Clean up old base regions
+      baseRegionsRef.current.forEach(region => {
+        if (region.contour && !region.contour.isDeleted()) {
+          region.contour.delete();
+        }
+        if (region.mask && !region.mask.isDeleted()) {
+          region.mask.delete();
+        }
+      });
+
+      // Save new base regions (deep clone)
+      baseRegionsRef.current = newRegions.map(region => {
+        const clonedContour = region.contour.clone();
+        const clonedMask = region.mask.clone();
+        return { ...region, contour: clonedContour, mask: clonedMask };
+      });
+
+      // Save new base brush strokes
+      baseBrushStrokesRef.current = JSON.parse(JSON.stringify(newBrushStrokes));
+
+      console.log('[Transform] Base state updated');
+    } catch (error) {
+      console.error('[Transform] Error updating base state:', error);
+    }
+  }, [cv]);
+
+  /**
+   * Apply the computed homography transformation to the image and all layers
+   * IMPORTANT: Always transform from the BASE state, not from current state
+   */
+  const applyTransformation = useCallback(() => {
+    if (!homographyMatrix || !baseImageRef.current || !cv) {
+      console.error('[Transform] Cannot apply transformation - missing data');
+      return;
+    }
+
+    try {
+      setStatus({ message: 'Applying perspective transformation...', type: 'info' });
+
+      console.log('[Transform] Applying homography transformation FROM BASE STATE');
+
+      // Step 1: Warp the BASE image (not the current possibly-already-transformed image)
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = baseImageRef.current.cols;
+      tempCanvas.height = baseImageRef.current.rows;
+      cv.imshow(tempCanvas, baseImageRef.current);
+
+      // Warp the image
+      const warpedCanvas = warpImage(
+        tempCanvas,
+        homographyMatrix,
+        baseImageRef.current.cols,
+        baseImageRef.current.rows
+      );
+
+      // Convert warped canvas back to OpenCV Mat
+      const warpedMat = cv.imread(warpedCanvas);
+
+      // Clean up old original image
+      if (originalImageRef.current) {
+        cleanupMats(originalImageRef.current);
+      }
+
+      // Update original image
+      setOriginalImage(warpedMat);
+      originalImageRef.current = warpedMat;
+
+      // Step 2: Transform all regions FROM BASE regions (not current regions)
+      const transformedRegions = baseRegionsRef.current.map(baseRegion => {
+        // Transform the BASE contour points
+        const newContour = new cv.Mat(baseRegion.contour.rows, 1, cv.CV_32SC2);
+
+        for (let i = 0; i < baseRegion.contour.rows; i++) {
+          const x = baseRegion.contour.data32S[i * 2];
+          const y = baseRegion.contour.data32S[i * 2 + 1];
+
+          try {
+            const transformed = applyHomography(homographyMatrix, { x, y });
+            newContour.data32S[i * 2] = Math.round(transformed.x);
+            newContour.data32S[i * 2 + 1] = Math.round(transformed.y);
+          } catch (e) {
+            // If point goes to infinity, keep original
+            newContour.data32S[i * 2] = x;
+            newContour.data32S[i * 2 + 1] = y;
+          }
+        }
+
+        // Recalculate bounds from transformed contour
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (let i = 0; i < newContour.rows; i++) {
+          const x = newContour.data32S[i * 2];
+          const y = newContour.data32S[i * 2 + 1];
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+
+        const newBounds = {
+          x: Math.max(0, minX),
+          y: Math.max(0, minY),
+          width: Math.min(warpedMat.cols, maxX) - Math.max(0, minX) + 1,
+          height: Math.min(warpedMat.rows, maxY) - Math.max(0, minY) + 1
+        };
+
+        // Generate a new mask from the transformed contour
+        // We can't just clone the old mask because pixel coordinates have changed
+        const newMask = cv.Mat.zeros(newBounds.height, newBounds.width, cv.CV_8UC1);
+
+        // Create a contour vector for drawContours
+        const contourVec = new cv.MatVector();
+
+        // Offset the contour to be relative to the bounds
+        const relativeContour = new cv.Mat(newContour.rows, 1, cv.CV_32SC2);
+        for (let i = 0; i < newContour.rows; i++) {
+          relativeContour.data32S[i * 2] = newContour.data32S[i * 2] - newBounds.x;
+          relativeContour.data32S[i * 2 + 1] = newContour.data32S[i * 2 + 1] - newBounds.y;
+        }
+
+        contourVec.push_back(relativeContour);
+        cv.drawContours(newMask, contourVec, 0, new cv.Scalar(255), -1);
+
+        // Clean up temporary objects
+        relativeContour.delete();
+        contourVec.delete();
+
+        // Keep the selected state, but use new contour, bounds, and mask
+        // Set scaleFactor to 1 since transformed contours are in full image coordinates
+        return {
+          ...baseRegion,
+          contour: newContour,
+          bounds: newBounds,
+          mask: newMask,
+          scaleFactor: 1
+        };
+      });
+
+      // Clean up old regions
+      regionsRef.current.forEach(region => {
+        if (region.contour && !region.contour.isDeleted()) {
+          region.contour.delete();
+        }
+        if (region.mask && !region.mask.isDeleted()) {
+          region.mask.delete();
+        }
+      });
+
+      setRegions(transformedRegions);
+      regionsRef.current = transformedRegions;
+
+      // Step 3: Transform brush strokes FROM BASE strokes (not current strokes)
+      const transformedStrokes = baseBrushStrokesRef.current.map(baseStroke => {
+        const transformedPoints = baseStroke.points.map(point => {
+          try {
+            return applyHomography(homographyMatrix, point);
+          } catch (e) {
+            return point; // Keep original if transformation fails
+          }
+        });
+
+        return {
+          ...baseStroke,
+          points: transformedPoints
+        };
+      });
+
+      setBrushStrokes(transformedStrokes);
+      brushStrokesRef.current = transformedStrokes;
+
+      // Update canvases
+      const segCanvas = segmentationCanvasRef.current;
+      cv.imshow(segCanvas, warpedMat);
+
+      // Redraw segmentation
+      drawSegmentation(warpedMat, transformedRegions, segCanvas, -1, cv);
+
+      // Update mask
+      createMask(warpedMat, transformedRegions, maskCanvasRef.current, cv);
+
+      // Reset transform points
+      setTransformPoints([]);
+      setHomographyMatrix(null);
+
+      // Force re-render of presenter canvas if in presenter mode
+      if (presenterMode) {
+        setTimeout(() => {
+          renderPresenterCanvas();
+        }, 100);
+      }
+
+      setStatus({ message: 'Transformation applied successfully!', type: 'success' });
+      console.log('[Transform] Transformation complete');
+
+      // NOTE: We do NOT update the base state here
+      // The base state should always remain the original untransformed state
+      // This ensures that pressing T again will show the original image
+      // and any new transformation is applied from the original coordinates
+
+    } catch (error) {
+      console.error('[Transform] Error applying transformation:', error);
+      setStatus({ message: 'Error applying transformation: ' + error.message, type: 'error' });
+    }
+  }, [homographyMatrix, cv, presenterMode, renderPresenterCanvas]);
 
   /**
    * AI-based segmentation using TensorFlow.js COCO-SSD
@@ -736,38 +1133,85 @@ function App() {
           exitPresenterMode();
           break;
         case 's':
-          setPresenterSubMode('segment');
+          if (!transformMode) {
+            setPresenterSubMode('segment');
+          }
           break;
         case 'b':
-          setPresenterSubMode('brush-black');
+          if (!transformMode) {
+            setPresenterSubMode('brush-black');
+          }
           break;
         case 'w':
-          setPresenterSubMode('brush-white');
+          if (!transformMode) {
+            setPresenterSubMode('brush-white');
+          }
           break;
         case 'e':
-          setPresenterSubMode('eraser');
+          if (!transformMode) {
+            setPresenterSubMode('eraser');
+          }
           break;
         case 'z':
           // Decrease brush size
-          setBrushSize(prev => Math.max(5, prev - 5));
+          if (!transformMode) {
+            setBrushSize(prev => Math.max(5, prev - 5));
+          }
           break;
         case 'x':
           // Increase brush size
-          setBrushSize(prev => Math.min(100, prev + 5));
+          if (!transformMode) {
+            setBrushSize(prev => Math.min(100, prev + 5));
+          }
+          break;
+        case 't':
+          // Enter transform mode and reset to original untransformed state
+          if (!transformMode) {
+            // On first entry: save the current (untransformed) state as base
+            if (!baseImageRef.current) {
+              console.log('[Transform] First T press - saving base state');
+              saveBaseState();
+            } else {
+              // On subsequent entries: restore to original untransformed state
+              console.log('[Transform] Subsequent T press - restoring to original base state');
+              restoreBaseState();
+            }
+
+            // Clear any previous transform points
+            setTransformPoints([]);
+            setHomographyMatrix(null);
+
+            setTransformMode(true);
+          }
           break;
       }
     };
 
+    const handleKeyUp = (e) => {
+      if (e.key.toLowerCase() === 't') {
+        // Apply transformation if we have a homography matrix
+        if (homographyMatrix && transformPoints.length === 8) {
+          applyTransformation();
+        }
+        // Exit transform mode when T is released
+        setTransformMode(false);
+      }
+    };
+
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [presenterMode, exitPresenterMode]);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [presenterMode, transformMode, exitPresenterMode, homographyMatrix, transformPoints, applyTransformation, saveBaseState, restoreBaseState]);
 
   // Presenter mode: Render canvas when state changes
   useEffect(() => {
     if (presenterMode) {
       renderPresenterCanvas();
     }
-  }, [presenterMode, regions, brushStrokes, currentStroke, renderPresenterCanvas]);
+  }, [presenterMode, regions, brushStrokes, currentStroke, transformMode, transformPoints, renderPresenterCanvas]);
 
   // Presenter mode: Handle window resize
   useEffect(() => {
@@ -787,12 +1231,47 @@ function App() {
   const handlePresenterMouseDown = useCallback((event) => {
     if (!presenterMode || !originalImage || !cv) return;
 
-    setPresenterIsDragging(true);
-
     const canvas = presenterCanvasRef.current;
     const rect = canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
+
+    // Handle transform mode point collection
+    if (transformMode) {
+      if (transformPoints.length < 8) {
+        // Alternate between source (red) and destination (green)
+        const pointType = transformPoints.length % 2 === 0 ? 'source' : 'dest';
+        const newPoints = [...transformPoints, { x, y, type: pointType }];
+        setTransformPoints(newPoints);
+
+        // If we have all 8 points (4 pairs), compute homography
+        if (newPoints.length === 8) {
+          try {
+            // Extract source and destination points
+            const sourcePoints = [];
+            const destPoints = [];
+
+            for (let i = 0; i < newPoints.length; i += 2) {
+              sourcePoints.push({ x: newPoints[i].x, y: newPoints[i].y });
+              destPoints.push({ x: newPoints[i + 1].x, y: newPoints[i + 1].y });
+            }
+
+            // Compute homography
+            const H = computeHomography(sourcePoints, destPoints);
+            setHomographyMatrix(H);
+
+            console.log('[Transform] Computed homography:', H);
+            setStatus({ message: 'Homography computed! Press T again to apply transformation.', type: 'success' });
+          } catch (error) {
+            console.error('[Transform] Error computing homography:', error);
+            setStatus({ message: 'Error computing homography: ' + error.message, type: 'error' });
+          }
+        }
+      }
+      return; // Don't process other interactions in transform mode
+    }
+
+    setPresenterIsDragging(true);
 
     if (presenterSubMode === 'segment') {
       // Convert screen coordinates to image coordinates
@@ -843,13 +1322,13 @@ function App() {
       // Store current brush size for eraser radius
       setCurrentStroke({ type: 'erase', points: [{ x, y }], size: brushSize });
     }
-  }, [presenterMode, presenterSubMode, originalImage, regions, cv, brushSize]);
+  }, [presenterMode, presenterSubMode, originalImage, regions, cv, brushSize, transformMode, transformPoints, homographyMatrix]);
 
   /**
    * Presenter mode: Handle mouse move
    */
   const handlePresenterMouseMove = useCallback((event) => {
-    if (!presenterMode || !presenterIsDragging) return;
+    if (!presenterMode || !presenterIsDragging || transformMode) return;
 
     const canvas = presenterCanvasRef.current;
     const rect = canvas.getBoundingClientRect();
@@ -1208,40 +1687,112 @@ function App() {
               position: 'absolute',
               top: '20px',
               left: '20px',
-              backgroundColor: 'rgba(0, 0, 0, 0.7)',
+              backgroundColor: transformMode ? 'rgba(255, 100, 0, 0.9)' : 'rgba(0, 0, 0, 0.7)',
               color: 'white',
               padding: '15px 20px',
               borderRadius: '8px',
               fontFamily: 'monospace',
               fontSize: '14px',
-              zIndex: 10000
+              zIndex: 10000,
+              border: transformMode ? '3px solid yellow' : 'none'
             }}>
               <div style={{ marginBottom: '8px', fontWeight: 'bold', fontSize: '16px' }}>
-                Presenter Mode
+                {transformMode ? 'TRANSFORM MODE' : 'Presenter Mode'}
               </div>
-              <div style={{ marginBottom: '4px' }}>
-                <strong>Mode:</strong> {
-                  presenterSubMode === 'segment' ? 'Segment Selection' :
-                  presenterSubMode === 'brush-white' ? 'White Brush' :
-                  presenterSubMode === 'brush-black' ? 'Black Brush' :
-                  'Eraser'
-                }
-              </div>
-              <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid rgba(255,255,255,0.3)' }}>
-                <div><kbd>S</kbd> Segment Mode</div>
-                <div><kbd>W</kbd> White Brush</div>
-                <div><kbd>B</kbd> Black Brush</div>
-                <div><kbd>E</kbd> Eraser</div>
-                <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)' }}>
-                  <kbd>Z</kbd> Smaller Brush
-                </div>
-                <div><kbd>X</kbd> Larger Brush</div>
-                <div style={{ marginTop: '8px' }}><kbd>ESC</kbd> Exit</div>
-              </div>
+
+              {transformMode ? (
+                <>
+                  <div style={{ marginBottom: '4px' }}>
+                    <strong>Points:</strong> {transformPoints.length} / 8
+                  </div>
+                  <div style={{ marginBottom: '4px' }}>
+                    {transformPoints.length < 8 ? (
+                      <span>Click to add {transformPoints.length % 2 === 0 ? 'RED (source)' : 'GREEN (dest)'} point</span>
+                    ) : (
+                      <span style={{ color: 'lime' }}>✓ Ready to apply!</span>
+                    )}
+                  </div>
+                  <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid rgba(255,255,255,0.3)' }}>
+                    <div><kbd>T</kbd> (hold) Transform Mode</div>
+                    <div style={{ marginTop: '8px', fontSize: '12px', opacity: 0.8 }}>
+                      Click 4 pairs of points:<br/>
+                      Red = source (image)<br/>
+                      Green = dest (wall)
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ marginBottom: '4px' }}>
+                    <strong>Mode:</strong> {
+                      presenterSubMode === 'segment' ? 'Segment Selection' :
+                      presenterSubMode === 'brush-white' ? 'White Brush' :
+                      presenterSubMode === 'brush-black' ? 'Black Brush' :
+                      'Eraser'
+                    }
+                  </div>
+                  <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid rgba(255,255,255,0.3)' }}>
+                    <div><kbd>S</kbd> Segment Mode</div>
+                    <div><kbd>W</kbd> White Brush</div>
+                    <div><kbd>B</kbd> Black Brush</div>
+                    <div><kbd>E</kbd> Eraser</div>
+                    <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)' }}>
+                      <kbd>Z</kbd> Smaller Brush
+                    </div>
+                    <div><kbd>X</kbd> Larger Brush</div>
+                    <div><kbd>T</kbd> Transform Mode</div>
+                    <div style={{ marginTop: '8px' }}><kbd>ESC</kbd> Exit</div>
+                  </div>
+                </>
+              )}
             </div>
 
+            {/* Transform controls */}
+            {transformMode && homographyMatrix && (
+              <div style={{
+                position: 'absolute',
+                top: '20px',
+                right: '20px',
+                backgroundColor: 'rgba(0, 200, 0, 0.9)',
+                color: 'white',
+                padding: '15px 20px',
+                borderRadius: '8px',
+                fontFamily: 'monospace',
+                fontSize: '14px',
+                zIndex: 10000,
+                border: '3px solid lime'
+              }}>
+                <div style={{ marginBottom: '8px', fontWeight: 'bold' }}>
+                  Homography Ready!
+                </div>
+                <button
+                  onClick={() => {
+                    setTransformPoints([]);
+                    setHomographyMatrix(null);
+                  }}
+                  style={{
+                    width: '100%',
+                    padding: '8px',
+                    marginBottom: '8px',
+                    backgroundColor: '#ff4444',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontWeight: 'bold'
+                  }}
+                >
+                  Reset Points
+                </button>
+                <div style={{ fontSize: '12px', opacity: 0.9 }}>
+                  Release T to exit<br/>
+                  Transform will be applied
+                </div>
+              </div>
+            )}
+
             {/* Brush size indicator */}
-            {(presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black' || presenterSubMode === 'eraser') && (
+            {!transformMode && (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black' || presenterSubMode === 'eraser') && (
               <div style={{
                 position: 'absolute',
                 top: '20px',
