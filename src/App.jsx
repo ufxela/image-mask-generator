@@ -48,6 +48,9 @@ function App() {
   const [presenterIsDragging, setPresenterIsDragging] = useState(false);
   const [showDownloadModal, setShowDownloadModal] = useState(false);
   const [finalPresenterImage, setFinalPresenterImage] = useState(null);
+  const [presenterMousePos, setPresenterMousePos] = useState(null); // {x, y, imgX, imgY} for hover preview
+  const [presenterSelectionRadius, setPresenterSelectionRadius] = useState(30); // Radius for segment selection in presenter mode
+  const [presenterDragMode, setPresenterDragMode] = useState(null); // 'select' or 'deselect' - set on mousedown, maintained during drag
 
   // Transform mode state
   const [transformMode, setTransformMode] = useState(false);
@@ -512,7 +515,9 @@ function App() {
     setPresenterMode(false);
     setPresenterSubMode('segment');
     setPresenterIsDragging(false);
+    setPresenterDragMode(null);
     setCurrentStroke(null);
+    setPresenterMousePos(null);
 
     // Exit fullscreen
     if (document.fullscreenElement) {
@@ -680,8 +685,141 @@ function App() {
       }
     }
 
+    // Draw hover preview
+    if (presenterMousePos && !transformMode) {
+      if (presenterSubMode === 'segment') {
+        // Check if hovering over a selected region (for deselecting)
+        const centerRegionIndex = findRegionAtPoint(presenterMousePos.imgX, presenterMousePos.imgY, regions);
+        const isHoveringSelected = centerRegionIndex !== -1 && regions[centerRegionIndex].selected;
+
+        if (isHoveringSelected) {
+          // Show only the single region that would be deselected (in red)
+          const region = regions[centerRegionIndex];
+          const scaleFactor = region.scaleFactor || 1;
+          const scale = 1 / scaleFactor;
+
+          ctx.globalAlpha = 0.5;
+          ctx.strokeStyle = 'red';
+          ctx.fillStyle = 'rgba(255, 0, 0, 0.3)';
+          ctx.lineWidth = 3;
+
+          // Create scaled contour for drawing
+          const scaledContour = new cv.Mat(region.contour.rows, 1, cv.CV_32SC2);
+          for (let i = 0; i < region.contour.rows; i++) {
+            const origX = region.contour.data32S[i * 2] * scale;
+            const origY = region.contour.data32S[i * 2 + 1] * scale;
+
+            // Convert from image coordinates to canvas coordinates
+            scaledContour.data32S[i * 2] = Math.round((origX / originalImage.cols) * displayWidth + offsetX);
+            scaledContour.data32S[i * 2 + 1] = Math.round((origY / originalImage.rows) * displayHeight + offsetY);
+          }
+
+          // Draw the contour as a path
+          ctx.beginPath();
+          for (let i = 0; i < scaledContour.rows; i++) {
+            const x = scaledContour.data32S[i * 2];
+            const y = scaledContour.data32S[i * 2 + 1];
+            if (i === 0) {
+              ctx.moveTo(x, y);
+            } else {
+              ctx.lineTo(x, y);
+            }
+          }
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+          ctx.globalAlpha = 1.0;
+
+          scaledContour.delete();
+        } else {
+          // Show all segments within radius that would be selected (in yellow/green)
+          const regionIndices = findRegionsInRadius(
+            presenterMousePos.imgX,
+            presenterMousePos.imgY,
+            presenterSelectionRadius,
+            regions
+          );
+
+          if (regionIndices.length > 0) {
+            for (const regionIndex of regionIndices) {
+              const region = regions[regionIndex];
+              if (region.selected) continue; // Don't highlight already selected regions
+
+              const scaleFactor = region.scaleFactor || 1;
+              const scale = 1 / scaleFactor;
+
+              // Draw the highlighted region with a yellow/green overlay
+              ctx.globalAlpha = 0.4;
+              ctx.strokeStyle = 'lime';
+              ctx.fillStyle = 'rgba(0, 255, 0, 0.3)';
+              ctx.lineWidth = 3;
+
+              // Create scaled contour for drawing
+              const scaledContour = new cv.Mat(region.contour.rows, 1, cv.CV_32SC2);
+              for (let i = 0; i < region.contour.rows; i++) {
+                const origX = region.contour.data32S[i * 2] * scale;
+                const origY = region.contour.data32S[i * 2 + 1] * scale;
+
+                // Convert from image coordinates to canvas coordinates
+                scaledContour.data32S[i * 2] = Math.round((origX / originalImage.cols) * displayWidth + offsetX);
+                scaledContour.data32S[i * 2 + 1] = Math.round((origY / originalImage.rows) * displayHeight + offsetY);
+              }
+
+              // Draw the contour as a path
+              ctx.beginPath();
+              for (let i = 0; i < scaledContour.rows; i++) {
+                const x = scaledContour.data32S[i * 2];
+                const y = scaledContour.data32S[i * 2 + 1];
+                if (i === 0) {
+                  ctx.moveTo(x, y);
+                } else {
+                  ctx.lineTo(x, y);
+                }
+              }
+              ctx.closePath();
+              ctx.fill();
+              ctx.stroke();
+
+              scaledContour.delete();
+            }
+            ctx.globalAlpha = 1.0;
+          }
+
+          // Draw selection radius circle (only when selecting, not deselecting)
+          ctx.globalAlpha = 0.3;
+          ctx.strokeStyle = 'white';
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+          ctx.lineWidth = 2;
+          ctx.setLineDash([5, 5]);
+
+          ctx.beginPath();
+          ctx.arc(presenterMousePos.x, presenterMousePos.y, presenterSelectionRadius, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1.0;
+        }
+      } else if (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black' || presenterSubMode === 'eraser') {
+        // Draw brush preview circle
+        const brushColor = presenterSubMode === 'brush-white' ? 'rgba(255, 255, 255, 0.5)' :
+                           presenterSubMode === 'brush-black' ? 'rgba(0, 0, 0, 0.8)' :
+                           'rgba(255, 0, 0, 0.5)'; // Red for eraser
+
+        ctx.globalAlpha = 0.7;
+        ctx.strokeStyle = presenterSubMode === 'eraser' ? 'red' : 'white';
+        ctx.fillStyle = brushColor;
+        ctx.lineWidth = 2;
+
+        ctx.beginPath();
+        ctx.arc(presenterMousePos.x, presenterMousePos.y, brushSize / 2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.globalAlpha = 1.0;
+      }
+    }
+
     return { displayWidth, displayHeight, offsetX, offsetY };
-  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize, transformMode, transformPoints, homographyMatrix]);
+  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize, transformMode, transformPoints, homographyMatrix, presenterMousePos, presenterSubMode, presenterSelectionRadius]);
 
   /**
    * Save the current state as the base (untransformed) state
@@ -1153,15 +1291,27 @@ function App() {
           }
           break;
         case 'z':
-          // Decrease brush size
+          // Decrease brush/selection radius size
           if (!transformMode) {
-            setBrushSize(prev => Math.max(5, prev - 5));
+            if (presenterSubMode === 'segment') {
+              // Geometric scaling for selection radius (20% decrease)
+              setPresenterSelectionRadius(prev => Math.max(5, Math.round(prev / 1.2)));
+            } else {
+              // Geometric scaling for brush size (20% decrease)
+              setBrushSize(prev => Math.max(5, Math.round(prev / 1.2)));
+            }
           }
           break;
         case 'x':
-          // Increase brush size
+          // Increase brush/selection radius size
           if (!transformMode) {
-            setBrushSize(prev => Math.min(100, prev + 5));
+            if (presenterSubMode === 'segment') {
+              // Geometric scaling for selection radius (20% increase), no upper limit
+              setPresenterSelectionRadius(prev => Math.round(prev * 1.2));
+            } else {
+              // Geometric scaling for brush size (20% increase), no upper limit
+              setBrushSize(prev => Math.round(prev * 1.2));
+            }
           }
           break;
         case 't':
@@ -1204,7 +1354,7 @@ function App() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [presenterMode, transformMode, exitPresenterMode, homographyMatrix, transformPoints, applyTransformation, saveBaseState, restoreBaseState]);
+  }, [presenterMode, transformMode, presenterSubMode, exitPresenterMode, homographyMatrix, transformPoints, applyTransformation, saveBaseState, restoreBaseState]);
 
   // Presenter mode: Render canvas when state changes
   useEffect(() => {
@@ -1301,17 +1451,39 @@ function App() {
       const imgX = ((x - offsetX) / displayWidth) * originalImage.cols;
       const imgY = ((y - offsetY) / displayHeight) * originalImage.rows;
 
-      // Find region at this point
-      const regionIndex = findRegionAtPoint(imgX, imgY, regions);
+      // Check if we're clicking on a selected region (to deselect)
+      const centerRegionIndex = findRegionAtPoint(imgX, imgY, regions);
 
-      if (regionIndex !== -1) {
+      if (centerRegionIndex !== -1 && regions[centerRegionIndex].selected) {
+        // Start deselecting mode: only affect the single region under cursor
+        setPresenterDragMode('deselect');
         const newRegions = [...regions];
-        newRegions[regionIndex].selected = !newRegions[regionIndex].selected;
+        newRegions[centerRegionIndex].selected = false;
         setRegions(newRegions);
         regionsRef.current = newRegions;
-
-        // Update the regular mask canvas too
         createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+      } else {
+        // Start selecting mode: use radius to select all regions within radius
+        setPresenterDragMode('select');
+        const regionIndices = findRegionsInRadius(imgX, imgY, presenterSelectionRadius, regions);
+
+        if (regionIndices.length > 0) {
+          const newRegions = [...regions];
+          let changed = false;
+
+          for (const idx of regionIndices) {
+            if (!newRegions[idx].selected) {
+              newRegions[idx].selected = true;
+              changed = true;
+            }
+          }
+
+          if (changed) {
+            setRegions(newRegions);
+            regionsRef.current = newRegions;
+            createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+          }
+        }
       }
     } else if (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black') {
       // Start a new brush stroke with current brush size
@@ -1328,47 +1500,79 @@ function App() {
    * Presenter mode: Handle mouse move
    */
   const handlePresenterMouseMove = useCallback((event) => {
-    if (!presenterMode || !presenterIsDragging || transformMode) return;
+    if (!presenterMode || transformMode) return;
 
     const canvas = presenterCanvasRef.current;
     const rect = canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
 
-    if (presenterSubMode === 'segment') {
-      // Similar to mouse down - toggle regions as we drag
-      const imageAspect = originalImage.cols / originalImage.rows;
-      const canvasAspect = canvas.width / canvas.height;
+    // Calculate image coordinates for hover preview
+    const imageAspect = originalImage.cols / originalImage.rows;
+    const canvasAspect = canvas.width / canvas.height;
 
-      let displayWidth, displayHeight, offsetX, offsetY;
+    let displayWidth, displayHeight, offsetX, offsetY;
 
-      if (imageAspect > canvasAspect) {
-        displayWidth = canvas.width;
-        displayHeight = canvas.width / imageAspect;
-        offsetX = 0;
-        offsetY = (canvas.height - displayHeight) / 2;
-      } else {
-        displayHeight = canvas.height;
-        displayWidth = canvas.height * imageAspect;
-        offsetX = (canvas.width - displayWidth) / 2;
-        offsetY = 0;
-      }
+    if (imageAspect > canvasAspect) {
+      displayWidth = canvas.width;
+      displayHeight = canvas.width / imageAspect;
+      offsetX = 0;
+      offsetY = (canvas.height - displayHeight) / 2;
+    } else {
+      displayHeight = canvas.height;
+      displayWidth = canvas.height * imageAspect;
+      offsetX = (canvas.width - displayWidth) / 2;
+      offsetY = 0;
+    }
 
-      if (x < offsetX || x > offsetX + displayWidth || y < offsetY || y > offsetY + displayHeight) {
-        return;
-      }
+    // Check if cursor is within the displayed image bounds
+    let imgX, imgY;
+    if (x >= offsetX && x <= offsetX + displayWidth && y >= offsetY && y <= offsetY + displayHeight) {
+      imgX = ((x - offsetX) / displayWidth) * originalImage.cols;
+      imgY = ((y - offsetY) / displayHeight) * originalImage.rows;
+      setPresenterMousePos({ x, y, imgX, imgY });
+    } else {
+      setPresenterMousePos(null);
+      if (!presenterIsDragging) return; // Exit early if not dragging and outside bounds
+    }
 
-      const imgX = ((x - offsetX) / displayWidth) * originalImage.cols;
-      const imgY = ((y - offsetY) / displayHeight) * originalImage.rows;
+    // Only process drag interactions if actually dragging
+    if (!presenterIsDragging) return;
 
-      const regionIndex = findRegionAtPoint(imgX, imgY, regions);
+    if (presenterSubMode === 'segment' && imgX !== undefined && imgY !== undefined) {
+      // Continue the drag in the mode we started with
+      if (presenterDragMode === 'deselect') {
+        // Deselecting: only affect single regions one at a time
+        const regionIndex = findRegionAtPoint(imgX, imgY, regions);
 
-      if (regionIndex !== -1 && !regions[regionIndex].selected) {
-        const newRegions = [...regions];
-        newRegions[regionIndex].selected = true;
-        setRegions(newRegions);
-        regionsRef.current = newRegions;
-        createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+        if (regionIndex !== -1 && regions[regionIndex].selected) {
+          const newRegions = [...regions];
+          newRegions[regionIndex].selected = false;
+          setRegions(newRegions);
+          regionsRef.current = newRegions;
+          createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+        }
+      } else if (presenterDragMode === 'select') {
+        // Selecting: use radius to select all regions within radius
+        const regionIndices = findRegionsInRadius(imgX, imgY, presenterSelectionRadius, regions);
+
+        if (regionIndices.length > 0) {
+          const newRegions = [...regions];
+          let changed = false;
+
+          for (const idx of regionIndices) {
+            if (!newRegions[idx].selected) {
+              newRegions[idx].selected = true;
+              changed = true;
+            }
+          }
+
+          if (changed) {
+            setRegions(newRegions);
+            regionsRef.current = newRegions;
+            createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+          }
+        }
       }
     } else if (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black') {
       // Continue the brush stroke
@@ -1387,7 +1591,14 @@ function App() {
         });
       }
     }
-  }, [presenterMode, presenterIsDragging, presenterSubMode, currentStroke, originalImage, regions, cv]);
+  }, [presenterMode, presenterIsDragging, presenterSubMode, presenterDragMode, currentStroke, originalImage, regions, cv, presenterSelectionRadius]);
+
+  /**
+   * Presenter mode: Handle mouse leave
+   */
+  const handlePresenterMouseLeave = useCallback(() => {
+    setPresenterMousePos(null);
+  }, []);
 
   /**
    * Presenter mode: Handle mouse up
@@ -1396,6 +1607,7 @@ function App() {
     if (!presenterMode) return;
 
     setPresenterIsDragging(false);
+    setPresenterDragMode(null); // Reset drag mode
 
     if (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black') {
       // Finalize the brush stroke
@@ -1674,7 +1886,10 @@ function App() {
               onMouseDown={handlePresenterMouseDown}
               onMouseMove={handlePresenterMouseMove}
               onMouseUp={handlePresenterMouseUp}
-              onMouseLeave={handlePresenterMouseUp}
+              onMouseLeave={() => {
+                handlePresenterMouseUp();
+                handlePresenterMouseLeave();
+              }}
               style={{
                 display: 'block',
                 width: '100%',
@@ -1737,9 +1952,9 @@ function App() {
                     <div><kbd>B</kbd> Black Brush</div>
                     <div><kbd>E</kbd> Eraser</div>
                     <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)' }}>
-                      <kbd>Z</kbd> Smaller Brush
+                      <kbd>Z</kbd> Smaller {presenterSubMode === 'segment' ? 'Radius' : 'Brush'}
                     </div>
-                    <div><kbd>X</kbd> Larger Brush</div>
+                    <div><kbd>X</kbd> Larger {presenterSubMode === 'segment' ? 'Radius' : 'Brush'}</div>
                     <div><kbd>T</kbd> Transform Mode</div>
                     <div style={{ marginTop: '8px' }}><kbd>ESC</kbd> Exit</div>
                   </div>
@@ -1791,8 +2006,8 @@ function App() {
               </div>
             )}
 
-            {/* Brush size indicator */}
-            {!transformMode && (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black' || presenterSubMode === 'eraser') && (
+            {/* Size indicator for brush/selection radius */}
+            {!transformMode && (
               <div style={{
                 position: 'absolute',
                 top: '20px',
@@ -1805,36 +2020,73 @@ function App() {
                 fontSize: '14px',
                 zIndex: 10000
               }}>
-                <div><strong>Brush Size:</strong> {brushSize}px</div>
-                <div style={{ marginTop: '8px' }}>
-                  <button
-                    onClick={() => setBrushSize(Math.max(5, brushSize - 5))}
-                    style={{
-                      padding: '4px 8px',
-                      marginRight: '4px',
-                      backgroundColor: '#444',
-                      color: 'white',
-                      border: 'none',
-                      borderRadius: '4px',
-                      cursor: 'pointer'
-                    }}
-                  >
-                    -
-                  </button>
-                  <button
-                    onClick={() => setBrushSize(Math.min(100, brushSize + 5))}
-                    style={{
-                      padding: '4px 8px',
-                      backgroundColor: '#444',
-                      color: 'white',
-                      border: 'none',
-                      borderRadius: '4px',
-                      cursor: 'pointer'
-                    }}
-                  >
-                    +
-                  </button>
-                </div>
+                {presenterSubMode === 'segment' ? (
+                  <>
+                    <div><strong>Selection Radius:</strong> {presenterSelectionRadius}px</div>
+                    <div style={{ marginTop: '8px' }}>
+                      <button
+                        onClick={() => setPresenterSelectionRadius(Math.max(5, Math.round(presenterSelectionRadius / 1.2)))}
+                        style={{
+                          padding: '4px 8px',
+                          marginRight: '4px',
+                          backgroundColor: '#444',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        -
+                      </button>
+                      <button
+                        onClick={() => setPresenterSelectionRadius(Math.round(presenterSelectionRadius * 1.2))}
+                        style={{
+                          padding: '4px 8px',
+                          backgroundColor: '#444',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        +
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div><strong>Brush Size:</strong> {brushSize}px</div>
+                    <div style={{ marginTop: '8px' }}>
+                      <button
+                        onClick={() => setBrushSize(Math.max(5, Math.round(brushSize / 1.2)))}
+                        style={{
+                          padding: '4px 8px',
+                          marginRight: '4px',
+                          backgroundColor: '#444',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        -
+                      </button>
+                      <button
+                        onClick={() => setBrushSize(Math.round(brushSize * 1.2))}
+                        style={{
+                          padding: '4px 8px',
+                          backgroundColor: '#444',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        +
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>
