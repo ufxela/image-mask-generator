@@ -779,11 +779,14 @@ function App() {
     // Apply brush strokes overlay
     if (brushStrokes.length > 0 || currentStroke) {
       const allStrokes = currentStroke ? [...brushStrokes, currentStroke] : brushStrokes;
+      // When image overlay is on, make strokes semi-transparent so image shows through
+      const strokeOpacity = showImageOverlay ? 0.5 : 1.0;
 
       for (const stroke of allStrokes) {
         // Handle polygon strokes (filled shapes)
         if (stroke.type === 'polygon-white' || stroke.type === 'polygon-black') {
           const color = stroke.type === 'polygon-white' ? 'white' : 'black';
+          ctx.globalAlpha = strokeOpacity;
           ctx.fillStyle = color;
           ctx.strokeStyle = color;
           ctx.lineWidth = 1;
@@ -799,6 +802,7 @@ function App() {
           continue;
         }
 
+        ctx.globalAlpha = strokeOpacity;
         ctx.strokeStyle = stroke.type === 'white' ? 'white' : 'black';
         ctx.fillStyle = stroke.type === 'white' ? 'white' : 'black';
         const strokeSize = stroke.size || brushSize; // Use stroke's stored size, or current brushSize for in-progress strokes
@@ -829,6 +833,7 @@ function App() {
           }
         }
       }
+      ctx.globalAlpha = 1.0;
     }
 
     // Draw in-progress polygon
