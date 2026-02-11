@@ -7,7 +7,8 @@ import {
   findRegionsInRadius,
   createMask,
   getCanvasMousePosition,
-  cleanupMats
+  cleanupMats,
+  selectSimilarRegions
 } from './utils/segmentation';
 import {
   computeHomography,
@@ -29,8 +30,8 @@ function App() {
   // State management
   const [originalImage, setOriginalImage] = useState(null);
   const [regions, setRegions] = useState([]);
-  const [sensitivity, setSensitivity] = useState(5);
-  const [regionSize, setRegionSize] = useState(20); // Default 20 = 1/20th of image
+  const [detailLevel, setDetailLevel] = useState(5);
+  const [mergeStrength, setMergeStrength] = useState(10);
   const [selectionRadius, setSelectionRadius] = useState(30); // Radius in pixels for drag selection
   const [status, setStatus] = useState({ message: '', type: 'info' });
   const [highlightedRegion, setHighlightedRegion] = useState(-1);
@@ -38,6 +39,10 @@ function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [cocoModel, setCocoModel] = useState(null);
   const [loadingAI, setLoadingAI] = useState(false);
+
+  // Undo/redo state
+  const [selectionHistory, setSelectionHistory] = useState([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
 
   // Presenter mode state
   const [presenterMode, setPresenterMode] = useState(false);
@@ -118,7 +123,7 @@ function App() {
       setRegions([]);
       regionsRef.current = [];
       setStatus({
-        message: 'Image loaded successfully! Adjust sensitivity and click "Segment Image".',
+        message: 'Image loaded successfully! Adjust settings and click "Segment Image".',
         type: 'success'
       });
     } catch (error) {
@@ -204,7 +209,9 @@ function App() {
     // Use setTimeout to allow UI to update
     setTimeout(() => {
       try {
-        const newRegions = segmentImage(originalImage, sensitivity, regionSize, cv);
+        const derivedSensitivity = detailLevel;
+        const derivedRegionSize = Math.round(10 + (detailLevel - 1) * (30 / 9));
+        const newRegions = segmentImage(originalImage, derivedSensitivity, derivedRegionSize, cv, mergeStrength);
 
         // If we have a saved selection, mark overlapping regions as selected
         if (savedSelectionMask) {
@@ -256,6 +263,11 @@ function App() {
         setRegions(newRegions);
         regionsRef.current = newRegions;
 
+        // Reset undo/redo history for new segmentation
+        const initialSnapshot = newRegions.map(r => r.selected);
+        setSelectionHistory([initialSnapshot]);
+        setHistoryIndex(0);
+
         drawSegmentation(
           originalImage,
           newRegions,
@@ -279,7 +291,59 @@ function App() {
         setStatus({ message: 'Error during segmentation: ' + error.message, type: 'error' });
       }
     }, 100);
-  }, [originalImage, sensitivity, regionSize, cv, regions]);
+  }, [originalImage, detailLevel, mergeStrength, cv, regions]);
+
+  /**
+   * Push the current selection state onto the undo history
+   */
+  const pushSelectionHistory = useCallback((currentRegions) => {
+    const snapshot = currentRegions.map(r => r.selected);
+    setSelectionHistory(prev => {
+      const truncated = prev.slice(0, historyIndex + 1);
+      const newHistory = [...truncated, snapshot];
+      if (newHistory.length > 50) newHistory.shift();
+      return newHistory;
+    });
+    setHistoryIndex(prev => Math.min(prev + 1, 49));
+  }, [historyIndex]);
+
+  /**
+   * Undo the last selection change
+   */
+  const undo = useCallback(() => {
+    if (historyIndex <= 0 || selectionHistory.length === 0 || regions.length === 0) return;
+    const newIndex = historyIndex - 1;
+    const snapshot = selectionHistory[newIndex];
+    if (!snapshot || snapshot.length !== regions.length) return;
+    const newRegions = regions.map((r, i) => ({ ...r, selected: snapshot[i] || false }));
+    setRegions(newRegions);
+    regionsRef.current = newRegions;
+    setHistoryIndex(newIndex);
+    if (originalImage && cv) {
+      drawSegmentation(originalImage, newRegions, segmentationCanvasRef.current, -1, cv);
+      createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+    }
+    setStatus({ message: 'Undo', type: 'info' });
+  }, [historyIndex, selectionHistory, regions, originalImage, cv]);
+
+  /**
+   * Redo a previously undone selection change
+   */
+  const redo = useCallback(() => {
+    if (historyIndex >= selectionHistory.length - 1 || regions.length === 0) return;
+    const newIndex = historyIndex + 1;
+    const snapshot = selectionHistory[newIndex];
+    if (!snapshot || snapshot.length !== regions.length) return;
+    const newRegions = regions.map((r, i) => ({ ...r, selected: snapshot[i] || false }));
+    setRegions(newRegions);
+    regionsRef.current = newRegions;
+    setHistoryIndex(newIndex);
+    if (originalImage && cv) {
+      drawSegmentation(originalImage, newRegions, segmentationCanvasRef.current, -1, cv);
+      createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+    }
+    setStatus({ message: 'Redo', type: 'info' });
+  }, [historyIndex, selectionHistory, regions, originalImage, cv]);
 
   /**
    * Handle mouse movement over segmentation canvas
@@ -360,11 +424,26 @@ function App() {
   const handleCanvasMouseDown = useCallback((event) => {
     if (regions.length === 0 || !originalImage || !cv) return;
 
-    setIsDragging(true);
-
-    // Also select the region under the cursor immediately
     const pos = getCanvasMousePosition(segmentationCanvasRef.current, event);
     const regionIndex = findRegionAtPoint(pos.x, pos.y, regions);
+
+    // Shift+Click: Select Similar regions
+    if (event.shiftKey && regionIndex !== -1) {
+      const toSelect = selectSimilarRegions(regionIndex, regions, mergeStrength > 0 ? mergeStrength : 40);
+      const newRegions = [...regions];
+      for (const idx of toSelect) {
+        newRegions[idx].selected = true;
+      }
+      setRegions(newRegions);
+      regionsRef.current = newRegions;
+      drawSegmentation(originalImage, newRegions, segmentationCanvasRef.current, regionIndex, cv);
+      createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+      pushSelectionHistory(newRegions);
+      setStatus({ message: `Selected ${toSelect.length} similar connected regions`, type: 'info' });
+      return;
+    }
+
+    setIsDragging(true);
 
     if (regionIndex !== -1) {
       const newRegions = [...regions];
@@ -384,7 +463,7 @@ function App() {
       // Automatically update mask
       createMask(originalImage, newRegions, maskCanvasRef.current, cv);
     }
-  }, [regions, originalImage, cv]);
+  }, [regions, originalImage, cv, mergeStrength, pushSelectionHistory]);
 
   /**
    * Handle mouse up on segmentation canvas to end drag selection
@@ -393,10 +472,11 @@ function App() {
     if (!isDragging) return;
 
     setIsDragging(false);
+    pushSelectionHistory(regions);
 
     const selectedCount = regions.filter(r => r.selected).length;
     setStatus({ message: `${selectedCount} region(s) selected`, type: 'info' });
-  }, [isDragging, regions]);
+  }, [isDragging, regions, pushSelectionHistory]);
 
   /**
    * Clear all region selections
@@ -405,6 +485,7 @@ function App() {
     const newRegions = regions.map(r => ({ ...r, selected: false }));
     setRegions(newRegions);
     regionsRef.current = newRegions;
+    pushSelectionHistory(newRegions);
     drawSegmentation(
       originalImage,
       newRegions,
@@ -420,7 +501,7 @@ function App() {
     ctx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
 
     setStatus({ message: 'Selection cleared.', type: 'info' });
-  }, [regions, originalImage, cv]);
+  }, [regions, originalImage, cv, pushSelectionHistory]);
 
 
   /**
@@ -1261,6 +1342,22 @@ function App() {
     };
   }, []);
 
+  // Keyboard shortcuts for undo/redo (normal mode)
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (presenterMode) return;
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+        e.preventDefault();
+        undo();
+      } else if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
+        e.preventDefault();
+        redo();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [presenterMode, undo, redo]);
+
   // Presenter mode: Keyboard event handler
   useEffect(() => {
     if (!presenterMode) return;
@@ -1291,15 +1388,22 @@ function App() {
           }
           break;
         case 'z':
-          // Decrease brush/selection radius size
-          if (!transformMode) {
+          if ((e.ctrlKey || e.metaKey) && !transformMode) {
+            e.preventDefault();
+            undo();
+          } else if (!transformMode) {
+            // Decrease brush/selection radius size
             if (presenterSubMode === 'segment') {
-              // Geometric scaling for selection radius (20% decrease)
               setPresenterSelectionRadius(prev => Math.max(5, Math.round(prev / 1.2)));
             } else {
-              // Geometric scaling for brush size (20% decrease)
               setBrushSize(prev => Math.max(5, Math.round(prev / 1.2)));
             }
+          }
+          break;
+        case 'y':
+          if ((e.ctrlKey || e.metaKey) && !transformMode) {
+            e.preventDefault();
+            redo();
           }
           break;
         case 'x':
@@ -1354,7 +1458,7 @@ function App() {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [presenterMode, transformMode, presenterSubMode, exitPresenterMode, homographyMatrix, transformPoints, applyTransformation, saveBaseState, restoreBaseState]);
+  }, [presenterMode, transformMode, presenterSubMode, exitPresenterMode, homographyMatrix, transformPoints, applyTransformation, saveBaseState, restoreBaseState, undo, redo]);
 
   // Presenter mode: Render canvas when state changes
   useEffect(() => {
@@ -1451,6 +1555,22 @@ function App() {
       const imgX = ((x - offsetX) / displayWidth) * originalImage.cols;
       const imgY = ((y - offsetY) / displayHeight) * originalImage.rows;
 
+      // Shift+Click: Select Similar regions
+      if (event.shiftKey) {
+        const regionIndex = findRegionAtPoint(imgX, imgY, regions);
+        if (regionIndex !== -1) {
+          const toSelect = selectSimilarRegions(regionIndex, regions, mergeStrength > 0 ? mergeStrength : 40);
+          const newRegions = [...regions];
+          for (const idx of toSelect) {
+            newRegions[idx].selected = true;
+          }
+          setRegions(newRegions);
+          regionsRef.current = newRegions;
+          createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+          return;
+        }
+      }
+
       // Check if we're clicking on a selected region (to deselect)
       const centerRegionIndex = findRegionAtPoint(imgX, imgY, regions);
 
@@ -1494,7 +1614,7 @@ function App() {
       // Store current brush size for eraser radius
       setCurrentStroke({ type: 'erase', points: [{ x, y }], size: brushSize });
     }
-  }, [presenterMode, presenterSubMode, originalImage, regions, cv, brushSize, transformMode, transformPoints, homographyMatrix]);
+  }, [presenterMode, presenterSubMode, originalImage, regions, cv, brushSize, transformMode, transformPoints, homographyMatrix, mergeStrength]);
 
   /**
    * Presenter mode: Handle mouse move
@@ -1609,6 +1729,11 @@ function App() {
     setPresenterIsDragging(false);
     setPresenterDragMode(null); // Reset drag mode
 
+    // Push undo history for segment mode
+    if (presenterSubMode === 'segment' && regions.length > 0) {
+      pushSelectionHistory(regions);
+    }
+
     if (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black') {
       // Finalize the brush stroke
       if (currentStroke && currentStroke.points.length > 0) {
@@ -1646,7 +1771,7 @@ function App() {
         setCurrentStroke(null);
       }
     }
-  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes]);
+  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes, regions, pushSelectionHistory]);
 
   // Show loading state while OpenCV loads
   if (cvLoading) {
@@ -1687,13 +1812,13 @@ function App() {
             <li><strong>Upload Image:</strong> Click "Choose Image" to upload a photo of your wall/collage</li>
             <li><strong>Adjust Settings:</strong> Use the sliders to control segmentation:
               <ul>
-                <li><strong>Sensitivity</strong> (1-10): Higher = more regions, better edge detection</li>
-                <li><strong>Region Size</strong> (10-40): Higher = smaller regions, more detail</li>
+                <li><strong>Detail Level</strong> (1-10): Lower = fewer, larger regions. Higher = more, smaller regions.</li>
+                <li><strong>Merge</strong> (0-100): How aggressively to merge similar adjacent regions. Higher = fewer, more meaningful segments.</li>
                 <li><strong>Brush Size</strong> (0-100px): Larger = select more regions at once when dragging</li>
               </ul>
             </li>
             <li><strong>Segment:</strong> Click "Segment Image" to divide the image into selectable regions</li>
-            <li><strong>Select Regions:</strong> Click and drag to paint-select regions (mask updates live on the right!)</li>
+            <li><strong>Select Regions:</strong> Click to toggle, drag to paint-select, Shift+Click to select all similar connected regions</li>
             <li><strong>Download:</strong> Click "Download Mask" to save your projection mask</li>
           </ul>
         </div>
@@ -1710,33 +1835,33 @@ function App() {
           </div>
 
           <div className="slider-group">
-            <label htmlFor="sensitivitySlider">Sensitivity:</label>
+            <label htmlFor="detailLevelSlider">Detail Level:</label>
             <input
               type="range"
-              id="sensitivitySlider"
+              id="detailLevelSlider"
               min="1"
               max="10"
-              value={sensitivity}
-              onChange={(e) => setSensitivity(parseInt(e.target.value))}
+              value={detailLevel}
+              onChange={(e) => setDetailLevel(parseInt(e.target.value))}
               disabled={!originalImage}
               title="Lower = fewer/larger regions, Higher = more/smaller regions"
             />
-            <span className="value">{sensitivity}</span>
+            <span className="value">{detailLevel}</span>
           </div>
 
           <div className="slider-group">
-            <label htmlFor="regionSizeSlider">Region Size:</label>
+            <label htmlFor="mergeStrengthSlider">Merge:</label>
             <input
               type="range"
-              id="regionSizeSlider"
-              min="10"
-              max="40"
-              value={regionSize}
-              onChange={(e) => setRegionSize(parseInt(e.target.value))}
+              id="mergeStrengthSlider"
+              min="0"
+              max="100"
+              value={mergeStrength}
+              onChange={(e) => setMergeStrength(parseInt(e.target.value))}
               disabled={!originalImage}
-              title="Lower = larger regions, Higher = smaller regions"
+              title="Higher = merge more similar adjacent regions (0 = no merging)"
             />
-            <span className="value">{regionSize}</span>
+            <span className="value">{mergeStrength}</span>
           </div>
 
           <div className="slider-group">

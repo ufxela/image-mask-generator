@@ -4,6 +4,31 @@
  */
 
 /**
+ * Union-Find (Disjoint Set) data structure for efficient region merging
+ */
+class UnionFind {
+  constructor(n) {
+    this.parent = Array.from({ length: n }, (_, i) => i);
+    this.rank = new Array(n).fill(0);
+  }
+  find(x) {
+    if (this.parent[x] !== x) {
+      this.parent[x] = this.find(this.parent[x]);
+    }
+    return this.parent[x];
+  }
+  union(a, b) {
+    const ra = this.find(a);
+    const rb = this.find(b);
+    if (ra === rb) return false;
+    if (this.rank[ra] < this.rank[rb]) { this.parent[ra] = rb; }
+    else if (this.rank[ra] > this.rank[rb]) { this.parent[rb] = ra; }
+    else { this.parent[rb] = ra; this.rank[ra]++; }
+    return true;
+  }
+}
+
+/**
  * Clean up OpenCV matrices to prevent memory leaks
  * OpenCV.js runs in WebAssembly and requires manual memory management
  */
@@ -26,7 +51,7 @@ export function cleanupMats(...mats) {
  * @param {object} cv - OpenCV.js instance
  * @returns {Array} Array of region objects with contour, mask, bounds, and selection state
  */
-export function segmentImage(originalImage, sensitivity, regionSize, cv) {
+export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeThreshold = 10) {
   if (!originalImage || !cv) {
     throw new Error('Invalid image or OpenCV instance');
   }
@@ -37,7 +62,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
   }
 
   const regions = [];
-  let gray, blurred, gradX, gradY, gradient, gradient3C, markers;
+  let gray, blurred, gradient, gradient3C, markers;
   let workingImage = originalImage;
   let scaleFactor = 1;
 
@@ -63,72 +88,63 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
       console.log('[Segmentation] Downscaled to:', workingImage.rows, 'x', workingImage.cols, `(${(workingImage.rows * workingImage.cols / 1000000).toFixed(1)}M pixels)`);
     }
 
-    // Step 1: Convert to grayscale
-    console.log('[Segmentation] Step 1: Converting to grayscale');
+    // Step 1: Edge detection for boundary-aware watershed
+    // Use both Sobel gradient and Canny for robust edge detection
+    console.log('[Segmentation] Step 1: Computing edges');
+
     gray = new cv.Mat();
+    cv.cvtColor(workingImage, gray, cv.COLOR_RGBA2GRAY);
 
-    try {
-      cv.cvtColor(workingImage, gray, cv.COLOR_RGBA2GRAY);
-    } catch (e) {
-      console.error('[Segmentation] Error in cvtColor:', e);
-      throw new Error(`cvtColor failed: ${e.message}`);
-    }
-
-    // Step 2: Apply bilateral filter to reduce noise while preserving edges
-    // Bilateral filtering is better than Gaussian for preserving sharp edges
-    console.log('[Segmentation] Step 2: Applying bilateral filter to preserve edges');
+    // Bilateral filter preserves edges while smoothing flat areas
     blurred = new cv.Mat();
-    cv.bilateralFilter(gray, blurred, 5, 75, 75);
+    cv.bilateralFilter(gray, blurred, 5, 50, 50);
 
-    // Step 3: Compute gradient magnitude (edge strength) with larger kernel for better edge detection
-    // This will guide watershed to follow edges more accurately
-    console.log('[Segmentation] Step 3: Computing gradient with enhanced edge detection');
-    gradX = new cv.Mat();
-    gradY = new cv.Mat();
+    // Sobel gradient for broad edge detection
+    const gradX = new cv.Mat();
+    const gradY = new cv.Mat();
     gradient = new cv.Mat();
-
-    try {
-      console.log('[Segmentation] Computing Sobel X with kernel size 5');
-      cv.Sobel(blurred, gradX, cv.CV_32F, 1, 0, 5); // Larger kernel (5 instead of 3) for better edges
-      console.log('[Segmentation] Computing Sobel Y with kernel size 5');
-      cv.Sobel(blurred, gradY, cv.CV_32F, 0, 1, 5);
-    } catch (e) {
-      console.error('[Segmentation] Error in Sobel:', e);
-      throw new Error(`Sobel failed: ${e.message}`);
-    }
-
-    // Compute magnitude: sqrt(gradX^2 + gradY^2)
-    // Use cv.magnitude if available, otherwise compute manually
+    cv.Sobel(blurred, gradX, cv.CV_32F, 1, 0, 3);
+    cv.Sobel(blurred, gradY, cv.CV_32F, 0, 1, 3);
     if (typeof cv.magnitude === 'function') {
-      console.log('[Segmentation] Using cv.magnitude');
       cv.magnitude(gradX, gradY, gradient);
     } else {
-      console.log('[Segmentation] Computing magnitude manually');
-      // Manual computation: magnitude = sqrt(x^2 + y^2)
-      const gradXSquared = new cv.Mat();
-      const gradYSquared = new cv.Mat();
-      cv.multiply(gradX, gradX, gradXSquared);
-      cv.multiply(gradY, gradY, gradYSquared);
-      cv.add(gradXSquared, gradYSquared, gradient);
+      const gx2 = new cv.Mat();
+      const gy2 = new cv.Mat();
+      cv.multiply(gradX, gradX, gx2);
+      cv.multiply(gradY, gradY, gy2);
+      cv.add(gx2, gy2, gradient);
       cv.sqrt(gradient, gradient);
-      cleanupMats(gradXSquared, gradYSquared);
+      cleanupMats(gx2, gy2);
     }
-
-    // Normalize gradient to 0-255 range
-    console.log('[Segmentation] Step 4: Normalizing gradient');
+    cleanupMats(gradX, gradY);
     cv.normalize(gradient, gradient, 0, 255, cv.NORM_MINMAX);
     gradient.convertTo(gradient, cv.CV_8U);
 
-    // Step 5: Create markers on a regular grid
-    // Sensitivity controls marker spacing (lower = larger spacing = larger/fewer regions)
-    // regionSize parameter controls target region size (higher = smaller regions)
-    console.log('[Segmentation] Step 5: Creating grid markers');
-    const maxRegionSize = Math.min(workingImage.cols, workingImage.rows) / regionSize;
-    const baseSpacing = maxRegionSize * 0.7; // Base spacing for medium-small regions
+    // Canny edge detection for thin/subtle lines (lower thresholds to catch low-contrast edges)
+    const canny = new cv.Mat();
+    cv.Canny(blurred, canny, 30, 90);
 
-    // Sensitivity adjusts spacing: 1 (low) = larger spacing, 10 (high) = much smaller spacing
-    // Use exponential curve to bias heavily toward smaller regions
-    const spacingMultiplier = 1.3 - (sensitivity / 10) * 1.1; // Range: 0.2 to 1.2
+    // Dilate Canny edges to make them thicker barriers
+    const dilateKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    const cannyDilated = new cv.Mat();
+    cv.dilate(canny, cannyDilated, dilateKernel);
+    dilateKernel.delete();
+    canny.delete();
+
+    // Combine: take maximum of Sobel gradient and dilated Canny edges
+    // This creates strong barriers at both broad gradients AND thin lines
+    const combined = new cv.Mat();
+    cv.max(gradient, cannyDilated, combined);
+    cannyDilated.delete();
+
+    console.log('[Segmentation] Edge detection complete');
+
+    // Step 2: Create markers on a regular grid
+    console.log('[Segmentation] Step 2: Creating grid markers');
+    const maxRegionSize = Math.min(workingImage.cols, workingImage.rows) / regionSize;
+    const baseSpacing = maxRegionSize * 0.7;
+
+    const spacingMultiplier = 1.3 - (sensitivity / 10) * 1.1;
     const spacing = Math.max(10, Math.floor(baseSpacing * spacingMultiplier));
 
     console.log(`[Segmentation] Grid spacing: ${spacing}px, Max region size: ${maxRegionSize}px`);
@@ -136,7 +152,6 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
     markers = cv.Mat.zeros(workingImage.rows, workingImage.cols, cv.CV_32S);
     let markerLabel = 1;
 
-    // Place markers in a grid pattern
     for (let y = Math.floor(spacing / 2); y < workingImage.rows; y += spacing) {
       for (let x = Math.floor(spacing / 2); x < workingImage.cols; x += spacing) {
         markers.intPtr(Math.floor(y), Math.floor(x))[0] = markerLabel;
@@ -147,41 +162,37 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
     const markerCount = markerLabel - 1;
     console.log(`[Segmentation] Created ${markerCount} markers`);
 
-    // Safety check: too many markers can cause memory issues
-    // For a 2000x2000 image with small spacing, we might need 3000-5000 markers
     if (markerCount > 5000) {
-      throw new Error(`Too many markers (${markerCount}). Try reducing sensitivity.`);
+      throw new Error(`Too many markers (${markerCount}). Try reducing detail level.`);
     }
 
-    // Step 6: Apply watershed algorithm
-    // Watershed needs a 3-channel image
-    console.log('[Segmentation] Step 6: Applying watershed');
+    // Step 3: Apply watershed on the edge/gradient image
+    // Using the gradient creates natural barriers at edges, so watershed
+    // boundaries follow image edges even for low-contrast lines
+    console.log('[Segmentation] Step 3: Applying watershed on edge-enhanced image');
 
-    // Check if watershed is available
     if (typeof cv.watershed !== 'function') {
-      throw new Error('cv.watershed is not available in this OpenCV.js build. Please check OpenCV.js version.');
+      throw new Error('cv.watershed is not available in this OpenCV.js build.');
     }
 
+    // Watershed requires 3-channel 8-bit image
     gradient3C = new cv.Mat();
-    console.log('[Segmentation] Converting gradient to BGR');
-    cv.cvtColor(gradient, gradient3C, cv.COLOR_GRAY2BGR);
-
-    console.log('[Segmentation] Calling watershed with markers');
-    console.log('[Segmentation] gradient3C:', gradient3C.rows, 'x', gradient3C.cols, 'channels:', gradient3C.channels());
-    console.log('[Segmentation] markers:', markers.rows, 'x', markers.cols, 'type:', markers.type());
+    cv.cvtColor(combined, gradient3C, cv.COLOR_GRAY2BGR);
+    combined.delete();
 
     cv.watershed(gradient3C, markers);
 
     console.log('[Segmentation] Watershed completed');
 
-    // Step 7: Extract regions from watershed result
+    // Step 4: Extract regions from watershed result
     // Watershed labels: -1 = boundary, 0 = background, >0 = region labels
-    console.log('[Segmentation] Step 7: Extracting regions');
+    console.log('[Segmentation] Step 4: Extracting regions');
 
     // MEMORY-EFFICIENT APPROACH: Collect pixel coordinates first, then create masks only for valid regions
     // This avoids creating 2000+ full-sized masks which would consume ~5-10GB of memory
     const regionPoints = new Map(); // Map<label, Array<{x, y}>>
     const minArea = (workingImage.cols * workingImage.rows) * 0.0001; // 0.01% minimum
+    const adjacencySet = new Set(); // Stores "min_max" strings for unique region adjacency pairs
 
     console.log(`[Segmentation] Scanning ${markers.rows * markers.cols} pixels...`);
 
@@ -230,11 +241,12 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
         }
       }
 
-      // Second pass: assign boundary/background pixels to nearest region
+      // Second pass: assign boundary/background pixels to nearest region and build adjacency graph
       console.log(`[Segmentation] Assigning ${boundaryPixels.length} boundary/background pixels to nearest regions...`);
       for (const pixel of boundaryPixels) {
         let nearestLabel = null;
         let minDist = Infinity;
+        const neighborLabels = [];
 
         // Check neighboring pixels (8-connected) to find nearest region
         for (let dy = -1; dy <= 1; dy++) {
@@ -247,6 +259,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
             if (nx >= 0 && nx < markers.cols && ny >= 0 && ny < markers.rows) {
               const neighborLabel = markers.intPtr(ny, nx)[0];
               if (neighborLabel > 0) {
+                neighborLabels.push(neighborLabel);
                 // Found a neighbor with a valid region
                 const dist = Math.abs(dx) + Math.abs(dy); // Manhattan distance
                 if (dist < minDist) {
@@ -255,6 +268,16 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
                 }
               }
             }
+          }
+        }
+
+        // Record adjacency: all distinct region labels around this boundary pixel are adjacent
+        const uniqueNeighborLabels = [...new Set(neighborLabels)];
+        for (let i = 0; i < uniqueNeighborLabels.length; i++) {
+          for (let j = i + 1; j < uniqueNeighborLabels.length; j++) {
+            const a = Math.min(uniqueNeighborLabels[i], uniqueNeighborLabels[j]);
+            const b = Math.max(uniqueNeighborLabels[i], uniqueNeighborLabels[j]);
+            adjacencySet.add(`${a}_${b}`);
           }
         }
 
@@ -282,8 +305,8 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
 
     console.log(`[Segmentation] Found ${regionPoints.size} regions from watershed`);
 
-    // Step 7.5: Redistribute pixels from small regions to ensure complete coverage
-    console.log('[Segmentation] Step 7.5: Redistributing pixels from small regions to ensure 100% coverage');
+    // Step 3.5: Redistribute pixels from small regions to ensure complete coverage
+    console.log('[Segmentation] Step 3.5: Redistributing pixels from small regions to ensure 100% coverage');
 
     // Identify small regions that will be filtered out
     const smallRegions = [];
@@ -350,8 +373,142 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
 
     console.log(`[Segmentation] After redistribution: ${regionPoints.size} regions remaining`);
 
-    // Step 8: Create masks and contours only for regions that meet minimum area
-    console.log('[Segmentation] Step 8: Creating masks and contours for valid regions');
+    // Step 4: Compute average color for each region (for merging and Select Similar)
+    console.log('[Segmentation] Step 4: Computing average colors for region merging');
+    const regionColors = new Map();
+
+    for (const [label, points] of regionPoints.entries()) {
+      let totalR = 0, totalG = 0, totalB = 0;
+      const sampleStep = Math.max(1, Math.floor(points.length / 200));
+      let sampleCount = 0;
+      for (let i = 0; i < points.length; i += sampleStep) {
+        const pt = points[i];
+        const pixelIdx = (pt.y * workingImage.cols + pt.x) * 4;
+        totalR += workingImage.data[pixelIdx];
+        totalG += workingImage.data[pixelIdx + 1];
+        totalB += workingImage.data[pixelIdx + 2];
+        sampleCount++;
+      }
+      if (sampleCount > 0) {
+        regionColors.set(label, {
+          r: totalR / sampleCount,
+          g: totalG / sampleCount,
+          b: totalB / sampleCount
+        });
+      }
+    }
+
+    // Step 5: Merge adjacent regions with similar colors
+    console.log(`[Segmentation] Step 5: Merging similar regions (threshold: ${mergeThreshold})`);
+
+    if (mergeThreshold > 0 && adjacencySet.size > 0) {
+      const labels = Array.from(regionPoints.keys());
+      const labelToIndex = new Map();
+      labels.forEach((label, idx) => labelToIndex.set(label, idx));
+
+      const uf = new UnionFind(labels.length);
+      // Track pixel count per union-find group to prevent oversized merges
+      const groupSize = labels.map(label => regionPoints.get(label).length);
+      const maxMergedArea = workingImage.cols * workingImage.rows * 0.03; // 3% of image max
+
+      for (const pairKey of adjacencySet) {
+        const sepIdx = pairKey.indexOf('_');
+        const a = parseInt(pairKey.substring(0, sepIdx));
+        const b = parseInt(pairKey.substring(sepIdx + 1));
+
+        if (!regionPoints.has(a) || !regionPoints.has(b)) continue;
+
+        const colorA = regionColors.get(a);
+        const colorB = regionColors.get(b);
+        if (!colorA || !colorB) continue;
+
+        const dist = Math.sqrt(
+          (colorA.r - colorB.r) ** 2 +
+          (colorA.g - colorB.g) ** 2 +
+          (colorA.b - colorB.b) ** 2
+        );
+
+        if (dist < mergeThreshold) {
+          const idxA = labelToIndex.get(a);
+          const idxB = labelToIndex.get(b);
+          if (idxA !== undefined && idxB !== undefined) {
+            const rootA = uf.find(idxA);
+            const rootB = uf.find(idxB);
+            if (rootA !== rootB) {
+              // Don't merge if combined size would be too large
+              if (groupSize[rootA] + groupSize[rootB] > maxMergedArea) continue;
+              uf.union(idxA, idxB);
+              // Update group size on the new root
+              const newRoot = uf.find(idxA);
+              groupSize[newRoot] = groupSize[rootA] + groupSize[rootB];
+            }
+          }
+        }
+      }
+
+      // Group regions by their union-find root
+      const rootToLabels = new Map();
+      for (let i = 0; i < labels.length; i++) {
+        const root = uf.find(i);
+        if (!rootToLabels.has(root)) {
+          rootToLabels.set(root, []);
+        }
+        rootToLabels.get(root).push(labels[i]);
+      }
+
+      // Merge pixel arrays and recompute average colors
+      const mergedRegionPoints = new Map();
+      for (const [root, memberLabels] of rootToLabels.entries()) {
+        const primaryLabel = memberLabels[0];
+        const allPoints = [];
+        let totalR = 0, totalG = 0, totalB = 0, totalWeight = 0;
+        for (const label of memberLabels) {
+          const pts = regionPoints.get(label);
+          allPoints.push(...pts);
+          const color = regionColors.get(label);
+          if (color) {
+            totalR += color.r * pts.length;
+            totalG += color.g * pts.length;
+            totalB += color.b * pts.length;
+            totalWeight += pts.length;
+          }
+        }
+        mergedRegionPoints.set(primaryLabel, allPoints);
+        if (totalWeight > 0) {
+          regionColors.set(primaryLabel, {
+            r: totalR / totalWeight,
+            g: totalG / totalWeight,
+            b: totalB / totalWeight
+          });
+        }
+      }
+
+      const premergeCount = regionPoints.size;
+      regionPoints.clear();
+      for (const [label, points] of mergedRegionPoints.entries()) {
+        regionPoints.set(label, points);
+      }
+
+      console.log(`[Segmentation] Merged ${premergeCount} regions down to ${regionPoints.size}`);
+    }
+
+    // Build post-merge adjacency map for Select Similar feature
+    const mergedAdjacency = new Map();
+    const survivingLabels = new Set(regionPoints.keys());
+    for (const pairKey of adjacencySet) {
+      const sepIdx = pairKey.indexOf('_');
+      const a = parseInt(pairKey.substring(0, sepIdx));
+      const b = parseInt(pairKey.substring(sepIdx + 1));
+      if (survivingLabels.has(a) && survivingLabels.has(b) && a !== b) {
+        if (!mergedAdjacency.has(a)) mergedAdjacency.set(a, new Set());
+        if (!mergedAdjacency.has(b)) mergedAdjacency.set(b, new Set());
+        mergedAdjacency.get(a).add(b);
+        mergedAdjacency.get(b).add(a);
+      }
+    }
+
+    // Step 6: Create masks and contours only for regions that meet minimum area
+    console.log('[Segmentation] Step 6: Creating masks and contours for valid regions');
 
     let processedCount = 0;
     for (const [label, points] of regionPoints.entries()) {
@@ -435,7 +592,10 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
               mask: mask.clone(),
               bounds: bounds, // In downscaled space
               scaleFactor: scaleFactor, // Store for later scaling
-              selected: false
+              selected: false,
+              label: label,
+              avgColor: regionColors.get(label) || { r: 128, g: 128, b: 128 },
+              adjacentIndices: [] // Will be populated after all regions are created
             });
 
             // Don't delete translatedContour - it's now owned by the region!
@@ -461,10 +621,27 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
 
     console.log(`[Segmentation] Returning ${regions.length} valid regions`);
 
+    // Populate adjacentIndices: map labels to final region indices
+    const labelToRegionIndex = new Map();
+    for (let i = 0; i < regions.length; i++) {
+      labelToRegionIndex.set(regions[i].label, i);
+    }
+    for (let i = 0; i < regions.length; i++) {
+      const adj = mergedAdjacency.get(regions[i].label);
+      if (adj) {
+        for (const neighborLabel of adj) {
+          const neighborIdx = labelToRegionIndex.get(neighborLabel);
+          if (neighborIdx !== undefined) {
+            regions[i].adjacentIndices.push(neighborIdx);
+          }
+        }
+      }
+    }
+
   } catch (error) {
     console.error('[Segmentation] Error:', error);
     // Clean up on error
-    cleanupMats(gray, blurred, gradX, gradY, gradient, markers, gradient3C);
+    cleanupMats(gray, blurred, gradient, markers, gradient3C);
     if (scaleFactor !== 1 && workingImage) {
       cleanupMats(workingImage);
     }
@@ -472,7 +649,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv) {
   }
 
   // Cleanup temporary matrices
-  cleanupMats(gray, blurred, gradX, gradY, gradient, markers, gradient3C);
+  cleanupMats(gray, blurred, gradient, markers, gradient3C);
   if (scaleFactor !== 1) {
     cleanupMats(workingImage);
   }
@@ -536,7 +713,36 @@ export function drawSegmentation(originalImage, regions, canvas, highlightIndex,
 
   const display = originalImage.clone();
 
-  // Draw all region boundaries
+  // Draw semi-transparent fills for selected and hovered regions
+  const hasHighlightOrSelected = highlightIndex >= 0 || regions.some(r => r.selected);
+  if (hasHighlightOrSelected) {
+    const overlay = display.clone();
+
+    for (let i = 0; i < regions.length; i++) {
+      const region = regions[i];
+      if (!region.selected && i !== highlightIndex) continue;
+
+      const scaleFactor = region.scaleFactor || 1;
+      const scale = 1 / scaleFactor;
+      const scaledContour = scaleContour(region.contour, scale, cv);
+      const contourVec = new cv.MatVector();
+      contourVec.push_back(scaledContour);
+
+      if (i === highlightIndex) {
+        cv.drawContours(overlay, contourVec, 0, new cv.Scalar(255, 255, 0, 255), -1);
+      } else if (region.selected) {
+        cv.drawContours(overlay, contourVec, 0, new cv.Scalar(0, 200, 0, 255), -1);
+      }
+
+      contourVec.delete();
+      scaledContour.delete();
+    }
+
+    cv.addWeighted(overlay, 0.25, display, 0.75, 0, display);
+    overlay.delete();
+  }
+
+  // Draw contour outlines on top of fills
   for (let i = 0; i < regions.length; i++) {
     const region = regions[i];
 
@@ -753,4 +959,50 @@ export function getCanvasMousePosition(canvas, event) {
     x: (event.clientX - rect.left) * scaleX,
     y: (event.clientY - rect.top) * scaleY
   };
+}
+
+/**
+ * Select all regions connected to a start region that have similar colors
+ * Uses BFS through the adjacency graph, comparing against the start region's color
+ *
+ * @param {number} startRegionIndex - Index of the region to start from
+ * @param {Array} regions - Array of region objects with avgColor and adjacentIndices
+ * @param {number} threshold - Maximum RGB distance to consider "similar"
+ * @returns {Array<number>} Array of region indices to select
+ */
+export function selectSimilarRegions(startRegionIndex, regions, threshold) {
+  const startRegion = regions[startRegionIndex];
+  if (!startRegion || !startRegion.avgColor) return [startRegionIndex];
+
+  const startColor = startRegion.avgColor;
+  const visited = new Set();
+  const toSelect = [];
+  const queue = [startRegionIndex];
+  visited.add(startRegionIndex);
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    toSelect.push(current);
+
+    const adjacentIndices = regions[current].adjacentIndices || [];
+    for (const neighborIdx of adjacentIndices) {
+      if (visited.has(neighborIdx)) continue;
+      visited.add(neighborIdx);
+
+      const neighbor = regions[neighborIdx];
+      if (!neighbor || !neighbor.avgColor) continue;
+
+      const dist = Math.sqrt(
+        (neighbor.avgColor.r - startColor.r) ** 2 +
+        (neighbor.avgColor.g - startColor.g) ** 2 +
+        (neighbor.avgColor.b - startColor.b) ** 2
+      );
+
+      if (dist < threshold) {
+        queue.push(neighborIdx);
+      }
+    }
+  }
+
+  return toSelect;
 }

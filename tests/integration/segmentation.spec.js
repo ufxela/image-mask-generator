@@ -84,9 +84,7 @@ test.describe('Image Segmentation Integration', () => {
     expect(segmentationLogs.length).toBeGreaterThan(0);
 
     // Verify critical steps were logged
-    expect(segmentationLogs.some(msg => msg.includes('Converting to grayscale'))).toBe(true);
-    expect(segmentationLogs.some(msg => msg.includes('Applying Gaussian blur'))).toBe(true);
-    expect(segmentationLogs.some(msg => msg.includes('Computing gradient'))).toBe(true);
+    expect(segmentationLogs.some(msg => msg.includes('Creating grid markers'))).toBe(true);
     expect(segmentationLogs.some(msg => msg.includes('Applying watershed'))).toBe(true);
     expect(segmentationLogs.some(msg => msg.includes('Extracting regions'))).toBe(true);
 
@@ -104,15 +102,13 @@ test.describe('Image Segmentation Integration', () => {
 
     console.log('✓ Clicked on canvas to select region');
 
-    // Create mask
-    await page.click('button:has-text("Create Mask")');
-
+    // Verify selection updated the status
     await page.waitForFunction(() => {
       const status = document.querySelector('.status');
-      return status && status.textContent.includes('Mask created');
+      return status && status.textContent.includes('selected');
     }, { timeout: 10000 });
 
-    console.log('✓ Mask created successfully');
+    console.log('✓ Region selection confirmed');
 
     // Print summary
     console.log('\n=== Test Summary ===');
@@ -122,7 +118,7 @@ test.describe('Image Segmentation Integration', () => {
     console.log(`Segmentation steps logged: ${segmentationLogs.length}`);
   });
 
-  test('should handle different sensitivity values', async ({ page }) => {
+  test('should handle different detail level values', async ({ page }) => {
     const errors = [];
     page.on('pageerror', error => {
       errors.push(error.message);
@@ -147,8 +143,8 @@ test.describe('Image Segmentation Integration', () => {
       return status && status.textContent.includes('Image loaded successfully');
     }, { timeout: 10000 });
 
-    // Test with sensitivity = 1 (fewer, larger regions)
-    await page.locator('#sensitivitySlider').fill('1');
+    // Test with detail level = 1 (fewer, larger regions)
+    await page.locator('#detailLevelSlider').fill('1');
     await page.click('button:has-text("Segment Image")');
 
     await page.waitForFunction(() => {
@@ -161,10 +157,10 @@ test.describe('Image Segmentation Integration', () => {
     const matchLow = statusLow.match(/Found (\d+) regions/);
     const regionsLow = parseInt(matchLow[1]);
 
-    console.log(`Sensitivity 1: ${regionsLow} regions`);
+    console.log(`Detail Level 1: ${regionsLow} regions`);
 
-    // Test with sensitivity = 10 (more, smaller regions)
-    await page.locator('#sensitivitySlider').fill('10');
+    // Test with detail level = 10 (more, smaller regions)
+    await page.locator('#detailLevelSlider').fill('10');
     await page.click('button:has-text("Segment Image")');
 
     await page.waitForFunction(() => {
@@ -177,7 +173,7 @@ test.describe('Image Segmentation Integration', () => {
     const matchHigh = statusHigh.match(/Found (\d+) regions/);
     const regionsHigh = parseInt(matchHigh[1]);
 
-    console.log(`Sensitivity 10: ${regionsHigh} regions`);
+    console.log(`Detail Level 10: ${regionsHigh} regions`);
 
     // Higher sensitivity should produce more regions
     expect(regionsHigh).toBeGreaterThan(regionsLow);
