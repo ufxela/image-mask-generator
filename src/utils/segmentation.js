@@ -851,40 +851,32 @@ export function findRegionsInRadius(x, y, radius, regions) {
     const distanceY = scaledY - closestY;
     const distanceSquared = distanceX * distanceX + distanceY * distanceY;
 
-    // If the bounding box intersects the circle, check mask pixels
+    // If the bounding box intersects the circle, check what fraction of the region is inside
     if (distanceSquared <= scaledRadius * scaledRadius) {
-      let found = false;
+      let insideCount = 0;
+      let totalCount = 0;
 
-      // Check the overlap region between the circle and the bounding box
-      const overlapMinX = Math.max(bounds.x, Math.floor(scaledX - scaledRadius));
-      const overlapMaxX = Math.min(bounds.x + bounds.width - 1, Math.ceil(scaledX + scaledRadius));
-      const overlapMinY = Math.max(bounds.y, Math.floor(scaledY - scaledRadius));
-      const overlapMaxY = Math.min(bounds.y + bounds.height - 1, Math.ceil(scaledY + scaledRadius));
+      // Sample the region's mask to estimate coverage
+      const step = Math.max(1, Math.floor(Math.max(bounds.width, bounds.height) / 20));
 
-      // Sample the overlap area - step through at intervals for performance
-      const overlapW = overlapMaxX - overlapMinX;
-      const overlapH = overlapMaxY - overlapMinY;
-      const step = Math.max(1, Math.floor(Math.min(overlapW, overlapH) / 8));
-
-      for (let sy = overlapMinY; sy <= overlapMaxY && !found; sy += step) {
-        for (let sx = overlapMinX; sx <= overlapMaxX && !found; sx += step) {
-          // Check if this point is within the circle
-          const dx = sx - scaledX;
-          const dy = sy - scaledY;
-          if (dx * dx + dy * dy > scaledRadius * scaledRadius) continue;
-
-          // Check if this point is in the region's mask
-          const lx = sx - bounds.x;
-          const ly = sy - bounds.y;
-          if (lx >= 0 && lx < region.mask.cols && ly >= 0 && ly < region.mask.rows) {
-            if (region.mask.ucharAt(ly, lx) > 0) {
-              found = true;
+      for (let ly = 0; ly < region.mask.rows; ly += step) {
+        for (let lx = 0; lx < region.mask.cols; lx += step) {
+          if (region.mask.ucharAt(ly, lx) > 0) {
+            totalCount++;
+            // Check if this mask pixel is within the circle
+            const px = bounds.x + lx;
+            const py = bounds.y + ly;
+            const dx = px - scaledX;
+            const dy = py - scaledY;
+            if (dx * dx + dy * dy <= scaledRadius * scaledRadius) {
+              insideCount++;
             }
           }
         }
       }
 
-      if (found) {
+      // Include region if >= 90% of its area is inside the circle
+      if (totalCount > 0 && (insideCount / totalCount) >= 0.9) {
         foundRegions.push(i);
       }
     }
