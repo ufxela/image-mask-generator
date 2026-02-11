@@ -1474,9 +1474,12 @@ function App() {
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (presenterMode) return;
-      if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key === 'z') {
         e.preventDefault();
         undo();
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'z') {
+        e.preventDefault();
+        redo();
       } else if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
         e.preventDefault();
         redo();
@@ -1539,7 +1542,10 @@ function App() {
           }
           break;
         case 'z':
-          if ((e.ctrlKey || e.metaKey) && !transformMode) {
+          if ((e.ctrlKey || e.metaKey) && e.shiftKey && !transformMode) {
+            e.preventDefault();
+            redo();
+          } else if ((e.ctrlKey || e.metaKey) && !transformMode) {
             e.preventDefault();
             undo();
           } else if (!transformMode) {
