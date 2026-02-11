@@ -62,7 +62,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
   }
 
   const regions = [];
-  let gray, blurred, gradient, gradient3C, markers;
+  let gray, blurred, gradient, gradient3C, markers, edgeMap;
   let workingImage = originalImage;
   let scaleFactor = 1;
 
@@ -138,6 +138,9 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     cannyDilated.delete();
 
     console.log('[Segmentation] Edge detection complete');
+
+    // Save edge map for boundary editing (clone before watershed consumes it)
+    edgeMap = combined.clone();
 
     // Step 2: Create markers on a regular grid
     console.log('[Segmentation] Step 2: Creating grid markers');
@@ -654,7 +657,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     cleanupMats(workingImage);
   }
 
-  return regions;
+  return { regions, edgeMap };
 }
 
 /**
@@ -1005,4 +1008,96 @@ export function selectSimilarRegions(startRegionIndex, regions, threshold) {
   }
 
   return toSelect;
+}
+
+/**
+ * Densify a contour by inserting interpolated points between vertices
+ * that are too far apart. Needed for smooth boundary editing.
+ *
+ * @param {cv.Mat} contour - Contour in CV_32SC2 format
+ * @param {number} maxSpacing - Maximum distance between consecutive points
+ * @param {object} cv - OpenCV instance
+ * @returns {cv.Mat} New densified contour (caller must delete)
+ */
+export function densifyContour(contour, maxSpacing, cv) {
+  if (!contour || contour.rows < 2) return contour.clone();
+
+  const newPoints = [];
+  for (let i = 0; i < contour.rows; i++) {
+    const x1 = contour.data32S[i * 2];
+    const y1 = contour.data32S[i * 2 + 1];
+    newPoints.push({ x: x1, y: y1 });
+
+    const nextI = (i + 1) % contour.rows;
+    const x2 = contour.data32S[nextI * 2];
+    const y2 = contour.data32S[nextI * 2 + 1];
+
+    const dist = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
+    if (dist > maxSpacing) {
+      const steps = Math.ceil(dist / maxSpacing);
+      for (let s = 1; s < steps; s++) {
+        const t = s / steps;
+        newPoints.push({
+          x: Math.round(x1 + (x2 - x1) * t),
+          y: Math.round(y1 + (y2 - y1) * t)
+        });
+      }
+    }
+  }
+
+  const result = new cv.Mat(newPoints.length, 1, cv.CV_32SC2);
+  for (let i = 0; i < newPoints.length; i++) {
+    result.data32S[i * 2] = newPoints[i].x;
+    result.data32S[i * 2 + 1] = newPoints[i].y;
+  }
+  return result;
+}
+
+/**
+ * Rebuild a region's mask from its contour.
+ * Call after modifying contour points.
+ *
+ * @param {object} region - Region object with contour, bounds, mask
+ * @param {object} cv - OpenCV instance
+ */
+export function rebuildRegionMask(region, cv) {
+  // Recompute bounds from contour
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < region.contour.rows; i++) {
+    const x = region.contour.data32S[i * 2];
+    const y = region.contour.data32S[i * 2 + 1];
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+
+  const newBounds = {
+    x: minX,
+    y: minY,
+    width: maxX - minX + 1,
+    height: maxY - minY + 1
+  };
+
+  // Create new mask from contour
+  if (region.mask && !region.mask.isDeleted()) {
+    region.mask.delete();
+  }
+  const newMask = cv.Mat.zeros(newBounds.height, newBounds.width, cv.CV_8U);
+
+  // Offset contour to local coordinates
+  const localContour = new cv.Mat(region.contour.rows, 1, cv.CV_32SC2);
+  for (let i = 0; i < region.contour.rows; i++) {
+    localContour.data32S[i * 2] = region.contour.data32S[i * 2] - newBounds.x;
+    localContour.data32S[i * 2 + 1] = region.contour.data32S[i * 2 + 1] - newBounds.y;
+  }
+
+  const contourVec = new cv.MatVector();
+  contourVec.push_back(localContour);
+  cv.drawContours(newMask, contourVec, 0, new cv.Scalar(255), -1);
+  contourVec.delete();
+  localContour.delete();
+
+  region.bounds = newBounds;
+  region.mask = newMask;
 }

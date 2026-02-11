@@ -11,6 +11,9 @@ import {
   cleanupMats,
   findRegionAtPoint,
   getCanvasMousePosition,
+  densifyContour,
+  rebuildRegionMask,
+  selectSimilarRegions,
 } from '../utils/segmentation';
 
 describe('Segmentation Utilities', () => {
@@ -559,5 +562,106 @@ describe('Segmentation Algorithm Properties', () => {
 
     expect(markerLimits.new).toBe(5000);
     expect(markerLimits.new).toBeGreaterThan(markerLimits.old);
+  });
+});
+
+describe('densifyContour', () => {
+  it('should insert points between distant vertices', () => {
+    const contour = new cv.Mat(2, 1, cv.CV_32SC2);
+    contour.data32S[0] = 0;
+    contour.data32S[1] = 0;
+    contour.data32S[2] = 100;
+    contour.data32S[3] = 0;
+
+    const result = densifyContour(contour, 10, cv);
+    expect(result.rows).toBeGreaterThan(2);
+    expect(result.data32S[0]).toBe(0);
+    expect(result.data32S[1]).toBe(0);
+
+    result.delete();
+    contour.delete();
+  });
+
+  it('should not add points when vertices are close together', () => {
+    const contour = new cv.Mat(3, 1, cv.CV_32SC2);
+    contour.data32S[0] = 0; contour.data32S[1] = 0;
+    contour.data32S[2] = 3; contour.data32S[3] = 0;
+    contour.data32S[4] = 3; contour.data32S[5] = 3;
+
+    const result = densifyContour(contour, 10, cv);
+    expect(result.rows).toBe(3);
+
+    result.delete();
+    contour.delete();
+  });
+
+  it('should handle single-point contour', () => {
+    const contour = new cv.Mat(1, 1, cv.CV_32SC2);
+    contour.data32S[0] = 50;
+    contour.data32S[1] = 50;
+
+    const result = densifyContour(contour, 10, cv);
+    expect(result.rows).toBe(1);
+
+    result.delete();
+    contour.delete();
+  });
+});
+
+describe('rebuildRegionMask', () => {
+  it('should update bounds from contour', () => {
+    const contour = new cv.Mat(4, 1, cv.CV_32SC2);
+    contour.data32S[0] = 10; contour.data32S[1] = 20;
+    contour.data32S[2] = 50; contour.data32S[3] = 20;
+    contour.data32S[4] = 50; contour.data32S[5] = 60;
+    contour.data32S[6] = 10; contour.data32S[7] = 60;
+
+    const region = {
+      contour: contour,
+      mask: null,
+      bounds: { x: 0, y: 0, width: 0, height: 0 }
+    };
+
+    rebuildRegionMask(region, cv);
+
+    expect(region.bounds.x).toBe(10);
+    expect(region.bounds.y).toBe(20);
+    expect(region.bounds.width).toBe(41);
+    expect(region.bounds.height).toBe(41);
+    expect(region.mask).not.toBeNull();
+  });
+});
+
+describe('selectSimilarRegions', () => {
+  it('should select connected regions with similar colors', () => {
+    const regions = [
+      { avgColor: { r: 100, g: 100, b: 100 }, adjacentIndices: [1, 2] },
+      { avgColor: { r: 105, g: 100, b: 100 }, adjacentIndices: [0] },
+      { avgColor: { r: 200, g: 200, b: 200 }, adjacentIndices: [0] },
+    ];
+
+    const result = selectSimilarRegions(0, regions, 20);
+    expect(result).toContain(0);
+    expect(result).toContain(1);
+    expect(result).not.toContain(2);
+  });
+
+  it('should not drift through chains of incrementally similar colors', () => {
+    const regions = [
+      { avgColor: { r: 100, g: 100, b: 100 }, adjacentIndices: [1] },
+      { avgColor: { r: 110, g: 100, b: 100 }, adjacentIndices: [0, 2] },
+      { avgColor: { r: 120, g: 100, b: 100 }, adjacentIndices: [1] },
+    ];
+
+    const result = selectSimilarRegions(0, regions, 15);
+    expect(result).toContain(0);
+    expect(result).toContain(1);
+    expect(result).not.toContain(2);
+  });
+
+  it('should handle region without avgColor', () => {
+    const regions = [{ adjacentIndices: [] }];
+    const result = selectSimilarRegions(0, regions, 20);
+    expect(result).toEqual([0]);
   });
 });

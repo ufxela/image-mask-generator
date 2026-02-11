@@ -8,7 +8,9 @@ import {
   createMask,
   getCanvasMousePosition,
   cleanupMats,
-  selectSimilarRegions
+  selectSimilarRegions,
+  densifyContour,
+  rebuildRegionMask
 } from './utils/segmentation';
 import {
   computeHomography,
@@ -64,6 +66,14 @@ function App() {
   const [editingPolygonIndex, setEditingPolygonIndex] = useState(null); // Index into brushStrokes of polygon being edited
   const [editingPointIndex, setEditingPointIndex] = useState(null); // Index of point being dragged
 
+  // Segment boundary editing state
+  const [segEditRegionIndex, setSegEditRegionIndex] = useState(null);
+  const [segEditPointIndex, setSegEditPointIndex] = useState(null);
+  const [segEditDragStart, setSegEditDragStart] = useState(null);
+  const [segEditOriginalPoints, setSegEditOriginalPoints] = useState(null);
+  const [segEditInfluenceRadius, setSegEditInfluenceRadius] = useState(30);
+  const [contoursAreDensified, setContoursAreDensified] = useState(false);
+
   // Transform mode state
   const [transformMode, setTransformMode] = useState(false);
   const [transformPoints, setTransformPoints] = useState([]); // Array of {x, y, type: 'source'|'dest'}
@@ -79,6 +89,7 @@ function App() {
   const originalImageRef = useRef(null);
   const regionsRef = useRef([]);
   const brushStrokesRef = useRef([]);
+  const edgeMapRef = useRef(null);
 
   // Store base/untransformed state for reset
   const baseImageRef = useRef(null);
@@ -218,7 +229,13 @@ function App() {
       try {
         const derivedSensitivity = detailLevel;
         const derivedRegionSize = Math.round(10 + (detailLevel - 1) * (30 / 9));
-        const newRegions = segmentImage(originalImage, derivedSensitivity, derivedRegionSize, cv, mergeStrength);
+        const result = segmentImage(originalImage, derivedSensitivity, derivedRegionSize, cv, mergeStrength);
+        const newRegions = result.regions;
+
+        // Store edge map for segment boundary editing
+        if (edgeMapRef.current) cleanupMats(edgeMapRef.current);
+        edgeMapRef.current = result.edgeMap;
+        setContoursAreDensified(false);
 
         // If we have a saved selection, mark overlapping regions as selected
         if (savedSelectionMask) {
@@ -899,6 +916,65 @@ function App() {
       }
     }
 
+    // Draw segment boundary edit handles
+    if (presenterSubMode === 'segment-edit') {
+      for (let ri = 0; ri < regions.length; ri++) {
+        const region = regions[ri];
+        const sf = region.scaleFactor || 1;
+        const scale = 1 / sf;
+
+        // Draw contour outline
+        ctx.strokeStyle = region.selected ? 'rgba(0,255,0,0.6)' : 'rgba(255,255,255,0.4)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let pi = 0; pi < region.contour.rows; pi++) {
+          const cx = region.contour.data32S[pi * 2] * scale;
+          const cy = region.contour.data32S[pi * 2 + 1] * scale;
+          const sx = (cx / originalImage.cols) * displayWidth + offsetX;
+          const sy = (cy / originalImage.rows) * displayHeight + offsetY;
+          if (pi === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+        }
+        ctx.closePath();
+        ctx.stroke();
+
+        // Draw vertex handles (only for the region being edited, or on hover)
+        if (ri === segEditRegionIndex || !segEditRegionIndex) {
+          // Find nearest point to cursor for highlighting
+          let nearestInRegion = -1;
+          if (presenterMousePos && segEditRegionIndex === null) {
+            let bestDist = 15;
+            for (let pi = 0; pi < region.contour.rows; pi++) {
+              const cx = region.contour.data32S[pi * 2] * scale;
+              const cy = region.contour.data32S[pi * 2 + 1] * scale;
+              const sx = (cx / originalImage.cols) * displayWidth + offsetX;
+              const sy = (cy / originalImage.rows) * displayHeight + offsetY;
+              const dx = presenterMousePos.x - sx;
+              const dy = presenterMousePos.y - sy;
+              const dist = Math.sqrt(dx * dx + dy * dy);
+              if (dist < bestDist) { bestDist = dist; nearestInRegion = pi; }
+            }
+          }
+
+          // Only draw handles for the nearest region or the active one
+          if (ri === segEditRegionIndex || nearestInRegion >= 0) {
+            for (let pi = 0; pi < region.contour.rows; pi += Math.max(1, Math.floor(region.contour.rows / 100))) {
+              const cx = region.contour.data32S[pi * 2] * scale;
+              const cy = region.contour.data32S[pi * 2 + 1] * scale;
+              const sx = (cx / originalImage.cols) * displayWidth + offsetX;
+              const sy = (cy / originalImage.rows) * displayHeight + offsetY;
+              const isActive = ri === segEditRegionIndex && pi === segEditPointIndex;
+              const isNearest = pi === nearestInRegion;
+              ctx.beginPath();
+              ctx.arc(sx, sy, isActive ? 6 : (isNearest ? 5 : 2), 0, Math.PI * 2);
+              ctx.fillStyle = isActive ? 'yellow' : (isNearest ? 'orange' : 'rgba(0,200,255,0.5)');
+              ctx.fill();
+            }
+          }
+        }
+      }
+    }
+
     // Draw hover preview
     if (presenterMousePos && !transformMode) {
       if (presenterSubMode === 'segment') {
@@ -1546,6 +1622,31 @@ function App() {
             setEditingPointIndex(null);
           }
           break;
+        case 'g':
+          if (!transformMode) {
+            if (presenterSubMode !== 'segment-edit') {
+              // Entering segment-edit mode: densify contours if needed
+              if (!contoursAreDensified && cv) {
+                const newRegions = regions.map(region => {
+                  const densified = densifyContour(region.contour, 5, cv);
+                  const oldContour = region.contour;
+                  const newRegion = { ...region, contour: densified };
+                  if (oldContour && !oldContour.isDeleted()) oldContour.delete();
+                  rebuildRegionMask(newRegion, cv);
+                  return newRegion;
+                });
+                setRegions(newRegions);
+                regionsRef.current = newRegions;
+                setContoursAreDensified(true);
+              }
+              setPresenterSubMode('segment-edit');
+            } else {
+              setPresenterSubMode('segment');
+            }
+            setSegEditRegionIndex(null);
+            setSegEditPointIndex(null);
+          }
+          break;
         case 'z':
           if ((e.ctrlKey || e.metaKey) && e.shiftKey && !transformMode) {
             e.preventDefault();
@@ -1824,6 +1925,50 @@ function App() {
         setPresenterIsDragging(true);
       }
       return;
+    } else if (presenterSubMode === 'segment-edit') {
+      // Find nearest contour point across all regions
+      const imageAspect = originalImage.cols / originalImage.rows;
+      const canvasAspect = canvas.width / canvas.height;
+      let dW, dH, oX, oY;
+      if (imageAspect > canvasAspect) { dW = canvas.width; dH = canvas.width / imageAspect; oX = 0; oY = (canvas.height - dH) / 2; }
+      else { dH = canvas.height; dW = canvas.height * imageAspect; oX = (canvas.width - dW) / 2; oY = 0; }
+
+      let bestDist = 15;
+      let bestRegion = null;
+      let bestPoint = null;
+      for (let ri = 0; ri < regions.length; ri++) {
+        const region = regions[ri];
+        const sf = region.scaleFactor || 1;
+        const scale = 1 / sf;
+        for (let pi = 0; pi < region.contour.rows; pi++) {
+          const cx = region.contour.data32S[pi * 2] * scale;
+          const cy = region.contour.data32S[pi * 2 + 1] * scale;
+          const sx = (cx / originalImage.cols) * dW + oX;
+          const sy = (cy / originalImage.rows) * dH + oY;
+          const dx = x - sx;
+          const dy = y - sy;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < bestDist) { bestDist = dist; bestRegion = ri; bestPoint = pi; }
+        }
+      }
+      if (bestRegion !== null) {
+        setSegEditRegionIndex(bestRegion);
+        setSegEditPointIndex(bestPoint);
+        // Store original contour points for falloff computation
+        const contour = regions[bestRegion].contour;
+        const pts = [];
+        for (let i = 0; i < contour.rows; i++) {
+          pts.push({ x: contour.data32S[i * 2], y: contour.data32S[i * 2 + 1] });
+        }
+        setSegEditOriginalPoints(pts);
+        const sf = regions[bestRegion].scaleFactor || 1;
+        setSegEditDragStart({
+          x: ((x - oX) / dW) * originalImage.cols * sf,
+          y: ((y - oY) / dH) * originalImage.rows * sf
+        });
+        setPresenterIsDragging(true);
+      }
+      return;
     }
   }, [presenterMode, presenterSubMode, originalImage, regions, cv, brushSize, transformMode, transformPoints, homographyMatrix, mergeStrength, polygonPoints, polygonColor, brushStrokes, pushHistory]);
 
@@ -1930,8 +2075,48 @@ function App() {
       newStrokes[editingPolygonIndex] = stroke;
       setBrushStrokes(newStrokes);
       brushStrokesRef.current = newStrokes;
+    } else if (presenterSubMode === 'segment-edit' && presenterIsDragging && segEditRegionIndex !== null && segEditPointIndex !== null && segEditOriginalPoints && segEditDragStart) {
+      // Drag segment boundary with Gaussian falloff
+      const region = regions[segEditRegionIndex];
+      const sf = region.scaleFactor || 1;
+
+      const canvas2 = presenterCanvasRef.current;
+      const imageAspect2 = originalImage.cols / originalImage.rows;
+      const canvasAspect2 = canvas2.width / canvas2.height;
+      let dW2, dH2, oX2, oY2;
+      if (imageAspect2 > canvasAspect2) { dW2 = canvas2.width; dH2 = canvas2.width / imageAspect2; oX2 = 0; oY2 = (canvas2.height - dH2) / 2; }
+      else { dH2 = canvas2.height; dW2 = canvas2.height * imageAspect2; oX2 = (canvas2.width - dW2) / 2; oY2 = 0; }
+
+      // Convert current mouse to downscaled coords
+      const curX = ((x - oX2) / dW2) * originalImage.cols * sf;
+      const curY = ((y - oY2) / dH2) * originalImage.rows * sf;
+      const deltaX = curX - segEditDragStart.x;
+      const deltaY = curY - segEditDragStart.y;
+
+      const numPts = segEditOriginalPoints.length;
+      const sigma = segEditInfluenceRadius / 2;
+      const newContour = new cv.Mat(numPts, 1, cv.CV_32SC2);
+
+      for (let i = 0; i < numPts; i++) {
+        // Distance along contour from the dragged point (wrapping)
+        let dAlong = Math.abs(i - segEditPointIndex);
+        dAlong = Math.min(dAlong, numPts - dAlong);
+
+        const weight = Math.exp(-(dAlong * dAlong) / (2 * sigma * sigma));
+
+        newContour.data32S[i * 2] = Math.round(segEditOriginalPoints[i].x + deltaX * weight);
+        newContour.data32S[i * 2 + 1] = Math.round(segEditOriginalPoints[i].y + deltaY * weight);
+      }
+
+      // Update region contour (replace old one)
+      const newRegions = [...regions];
+      const oldContour = newRegions[segEditRegionIndex].contour;
+      newRegions[segEditRegionIndex] = { ...newRegions[segEditRegionIndex], contour: newContour };
+      if (oldContour && !oldContour.isDeleted()) oldContour.delete();
+      setRegions(newRegions);
+      regionsRef.current = newRegions;
     }
-  }, [presenterMode, presenterIsDragging, presenterSubMode, presenterDragMode, currentStroke, originalImage, regions, cv, presenterSelectionRadius, editingPolygonIndex, editingPointIndex, brushStrokes]);
+  }, [presenterMode, presenterIsDragging, presenterSubMode, presenterDragMode, currentStroke, originalImage, regions, cv, presenterSelectionRadius, editingPolygonIndex, editingPointIndex, brushStrokes, segEditRegionIndex, segEditPointIndex, segEditOriginalPoints, segEditDragStart, segEditInfluenceRadius]);
 
   /**
    * Presenter mode: Handle mouse leave
@@ -2019,12 +2204,76 @@ function App() {
         }
       }
     } else if (presenterSubMode === 'polygon-edit' && editingPolygonIndex !== null) {
-      // Finished dragging polygon vertex - push history
       pushHistory(regions, brushStrokes);
       setEditingPolygonIndex(null);
       setEditingPointIndex(null);
+    } else if (presenterSubMode === 'segment-edit' && segEditRegionIndex !== null) {
+      // Edge snap: shift each moved contour point toward nearest strong edge
+      const region = regions[segEditRegionIndex];
+      const edgeMap = edgeMapRef.current;
+
+      if (edgeMap && cv && segEditOriginalPoints) {
+        const contour = region.contour;
+        const numPts = contour.rows;
+        const sigma = segEditInfluenceRadius / 2;
+
+        for (let i = 0; i < numPts; i++) {
+          let dAlong = Math.abs(i - segEditPointIndex);
+          dAlong = Math.min(dAlong, numPts - dAlong);
+          const weight = Math.exp(-(dAlong * dAlong) / (2 * sigma * sigma));
+          if (weight < 0.05) continue; // Skip unaffected points
+
+          const px = contour.data32S[i * 2];
+          const py = contour.data32S[i * 2 + 1];
+
+          // Compute local contour direction for perpendicular search
+          const prevI = (i - 1 + numPts) % numPts;
+          const nextI = (i + 1) % numPts;
+          const dx = contour.data32S[nextI * 2] - contour.data32S[prevI * 2];
+          const dy = contour.data32S[nextI * 2 + 1] - contour.data32S[prevI * 2 + 1];
+          const len = Math.sqrt(dx * dx + dy * dy) || 1;
+          const nx = -dy / len; // perpendicular
+          const ny = dx / len;
+
+          // Search along perpendicular for strongest edge
+          let bestT = 0;
+          let bestStrength = 0;
+          for (let t = -5; t <= 5; t++) {
+            const sx = Math.round(px + nx * t);
+            const sy = Math.round(py + ny * t);
+            if (sx >= 0 && sx < edgeMap.cols && sy >= 0 && sy < edgeMap.rows) {
+              const strength = edgeMap.ucharAt(sy, sx);
+              if (strength > bestStrength) {
+                bestStrength = strength;
+                bestT = t;
+              }
+            }
+          }
+
+          // Snap to edge if strong enough
+          if (bestStrength > 50 && bestT !== 0) {
+            contour.data32S[i * 2] = Math.round(px + nx * bestT);
+            contour.data32S[i * 2 + 1] = Math.round(py + ny * bestT);
+          }
+        }
+      }
+
+      // Rebuild mask from modified contour
+      rebuildRegionMask(region, cv);
+
+      // Update canvases
+      if (originalImage) {
+        drawSegmentation(originalImage, regions, segmentationCanvasRef.current, -1, cv);
+        createMask(originalImage, regions, maskCanvasRef.current, cv);
+      }
+
+      pushHistory(regions, brushStrokes);
+      setSegEditRegionIndex(null);
+      setSegEditPointIndex(null);
+      setSegEditDragStart(null);
+      setSegEditOriginalPoints(null);
     }
-  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes, regions, pushHistory, editingPolygonIndex]);
+  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes, regions, pushHistory, editingPolygonIndex, segEditRegionIndex, segEditPointIndex, segEditOriginalPoints, segEditInfluenceRadius, cv, originalImage]);
 
   // Show loading state while OpenCV loads
   if (cvLoading) {
@@ -2326,6 +2575,7 @@ function App() {
                       presenterSubMode === 'brush-black' ? 'Black Brush' :
                       presenterSubMode === 'polygon' ? `Polygon (${polygonColor})` :
                       presenterSubMode === 'polygon-edit' ? 'Polygon Edit' :
+                      presenterSubMode === 'segment-edit' ? 'Segment Edge Edit' :
                       'Eraser'
                     }
                   </div>
@@ -2337,6 +2587,7 @@ function App() {
                     <div><kbd>O</kbd> Image Overlay {showImageOverlay ? '(ON)' : '(off)'}</div>
                     <div><kbd>P</kbd> Polygon Tool</div>
                     <div><kbd>D</kbd> Polygon Edit</div>
+                    <div><kbd>G</kbd> Segment Edge Edit</div>
                     <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)' }}>
                       <kbd>Z</kbd> Smaller {presenterSubMode === 'segment' ? 'Radius' : 'Brush'}
                     </div>
