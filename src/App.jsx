@@ -58,6 +58,12 @@ function App() {
   const [presenterDragMode, setPresenterDragMode] = useState(null); // 'select' or 'deselect' - set on mousedown, maintained during drag
   const [showImageOverlay, setShowImageOverlay] = useState(false); // Toggle original image overlay in presenter mode
 
+  // Polygon tool state
+  const [polygonPoints, setPolygonPoints] = useState([]); // Points of polygon being drawn
+  const [polygonColor, setPolygonColor] = useState('white'); // 'white' or 'black'
+  const [editingPolygonIndex, setEditingPolygonIndex] = useState(null); // Index into brushStrokes of polygon being edited
+  const [editingPointIndex, setEditingPointIndex] = useState(null); // Index of point being dragged
+
   // Transform mode state
   const [transformMode, setTransformMode] = useState(false);
   const [transformPoints, setTransformPoints] = useState([]); // Array of {x, y, type: 'source'|'dest'}
@@ -775,6 +781,24 @@ function App() {
       const allStrokes = currentStroke ? [...brushStrokes, currentStroke] : brushStrokes;
 
       for (const stroke of allStrokes) {
+        // Handle polygon strokes (filled shapes)
+        if (stroke.type === 'polygon-white' || stroke.type === 'polygon-black') {
+          const color = stroke.type === 'polygon-white' ? 'white' : 'black';
+          ctx.fillStyle = color;
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 1;
+          if (stroke.points.length >= 3) {
+            ctx.beginPath();
+            ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
+            for (let i = 1; i < stroke.points.length; i++) {
+              ctx.lineTo(stroke.points[i].x, stroke.points[i].y);
+            }
+            ctx.closePath();
+            ctx.fill();
+          }
+          continue;
+        }
+
         ctx.strokeStyle = stroke.type === 'white' ? 'white' : 'black';
         ctx.fillStyle = stroke.type === 'white' ? 'white' : 'black';
         const strokeSize = stroke.size || brushSize; // Use stroke's stored size, or current brushSize for in-progress strokes
@@ -803,6 +827,69 @@ function App() {
             ctx.arc(point.x, point.y, strokeSize / 2, 0, Math.PI * 2);
             ctx.fill();
           }
+        }
+      }
+    }
+
+    // Draw in-progress polygon
+    if (presenterSubMode === 'polygon' && polygonPoints.length > 0) {
+      const polyColor = polygonColor === 'white' ? 'white' : 'black';
+      ctx.strokeStyle = polyColor;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([]);
+
+      // Draw completed edges
+      ctx.beginPath();
+      ctx.moveTo(polygonPoints[0].x, polygonPoints[0].y);
+      for (let i = 1; i < polygonPoints.length; i++) {
+        ctx.lineTo(polygonPoints[i].x, polygonPoints[i].y);
+      }
+      // Draw line from last point to cursor
+      if (presenterMousePos) {
+        ctx.lineTo(presenterMousePos.x, presenterMousePos.y);
+      }
+      ctx.stroke();
+
+      // Draw vertices
+      for (let i = 0; i < polygonPoints.length; i++) {
+        ctx.beginPath();
+        ctx.arc(polygonPoints[i].x, polygonPoints[i].y, 5, 0, Math.PI * 2);
+        ctx.fillStyle = i === 0 ? 'red' : polyColor;
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+
+      // Highlight start point in red when cursor is near it (for closing)
+      if (presenterMousePos && polygonPoints.length >= 3) {
+        const dx = presenterMousePos.x - polygonPoints[0].x;
+        const dy = presenterMousePos.y - polygonPoints[0].y;
+        if (Math.sqrt(dx * dx + dy * dy) < 15) {
+          ctx.beginPath();
+          ctx.arc(polygonPoints[0].x, polygonPoints[0].y, 15, 0, Math.PI * 2);
+          ctx.strokeStyle = 'red';
+          ctx.lineWidth = 3;
+          ctx.stroke();
+        }
+      }
+    }
+
+    // Draw polygon edit mode handles
+    if (presenterSubMode === 'polygon-edit') {
+      for (let si = 0; si < brushStrokes.length; si++) {
+        const stroke = brushStrokes[si];
+        if (stroke.type !== 'polygon-white' && stroke.type !== 'polygon-black') continue;
+        for (let pi = 0; pi < stroke.points.length; pi++) {
+          const pt = stroke.points[pi];
+          const isActive = si === editingPolygonIndex && pi === editingPointIndex;
+          ctx.beginPath();
+          ctx.arc(pt.x, pt.y, isActive ? 8 : 5, 0, Math.PI * 2);
+          ctx.fillStyle = isActive ? 'yellow' : 'cyan';
+          ctx.fill();
+          ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+          ctx.lineWidth = 1;
+          ctx.stroke();
         }
       }
     }
@@ -941,7 +1028,7 @@ function App() {
     }
 
     return { displayWidth, displayHeight, offsetX, offsetY };
-  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize, transformMode, transformPoints, homographyMatrix, presenterMousePos, presenterSubMode, presenterSelectionRadius, showImageOverlay]);
+  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize, transformMode, transformPoints, homographyMatrix, presenterMousePos, presenterSubMode, presenterSelectionRadius, showImageOverlay, polygonPoints, polygonColor, editingPolygonIndex, editingPointIndex]);
 
   /**
    * Save the current state as the base (untransformed) state
@@ -1433,6 +1520,24 @@ function App() {
             setShowImageOverlay(prev => !prev);
           }
           break;
+        case 'p':
+          if (!transformMode) {
+            if (presenterSubMode === 'polygon') {
+              // Toggle polygon color if already in polygon mode
+              setPolygonColor(prev => prev === 'white' ? 'black' : 'white');
+            } else {
+              setPresenterSubMode('polygon');
+              setPolygonPoints([]);
+            }
+          }
+          break;
+        case 'd':
+          if (!transformMode) {
+            setPresenterSubMode(prev => prev === 'polygon-edit' ? 'segment' : 'polygon-edit');
+            setEditingPolygonIndex(null);
+            setEditingPointIndex(null);
+          }
+          break;
         case 'z':
           if ((e.ctrlKey || e.metaKey) && !transformMode) {
             e.preventDefault();
@@ -1659,8 +1764,57 @@ function App() {
       // Start erasing - we'll remove strokes that intersect
       // Store current brush size for eraser radius
       setCurrentStroke({ type: 'erase', points: [{ x, y }], size: brushSize });
+    } else if (presenterSubMode === 'polygon') {
+      // Polygon drawing mode - each click adds a vertex
+      if (polygonPoints.length >= 3) {
+        // Check if clicking near the start point to close the polygon
+        const dx = x - polygonPoints[0].x;
+        const dy = y - polygonPoints[0].y;
+        if (Math.sqrt(dx * dx + dy * dy) < 15) {
+          // Close the polygon - add it as a completed stroke
+          const newStroke = {
+            type: polygonColor === 'white' ? 'polygon-white' : 'polygon-black',
+            points: [...polygonPoints],
+            size: 0
+          };
+          const newStrokes = [...brushStrokes, newStroke];
+          setBrushStrokes(newStrokes);
+          brushStrokesRef.current = newStrokes;
+          pushHistory(regions, newStrokes);
+          setPolygonPoints([]);
+          return;
+        }
+      }
+      // Add a new vertex
+      setPolygonPoints(prev => [...prev, { x, y }]);
+      return;
+    } else if (presenterSubMode === 'polygon-edit') {
+      // Find nearest polygon vertex to start dragging
+      let bestDist = 20; // Max grab distance
+      let bestStroke = null;
+      let bestPoint = null;
+      for (let si = 0; si < brushStrokes.length; si++) {
+        const stroke = brushStrokes[si];
+        if (stroke.type !== 'polygon-white' && stroke.type !== 'polygon-black') continue;
+        for (let pi = 0; pi < stroke.points.length; pi++) {
+          const dx = x - stroke.points[pi].x;
+          const dy = y - stroke.points[pi].y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < bestDist) {
+            bestDist = dist;
+            bestStroke = si;
+            bestPoint = pi;
+          }
+        }
+      }
+      if (bestStroke !== null) {
+        setEditingPolygonIndex(bestStroke);
+        setEditingPointIndex(bestPoint);
+        setPresenterIsDragging(true);
+      }
+      return;
     }
-  }, [presenterMode, presenterSubMode, originalImage, regions, cv, brushSize, transformMode, transformPoints, homographyMatrix, mergeStrength]);
+  }, [presenterMode, presenterSubMode, originalImage, regions, cv, brushSize, transformMode, transformPoints, homographyMatrix, mergeStrength, polygonPoints, polygonColor, brushStrokes, pushHistory]);
 
   /**
    * Presenter mode: Handle mouse move
@@ -1756,8 +1910,17 @@ function App() {
           points: [...currentStroke.points, { x, y }]
         });
       }
+    } else if (presenterSubMode === 'polygon-edit' && presenterIsDragging && editingPolygonIndex !== null && editingPointIndex !== null) {
+      // Drag polygon vertex
+      const newStrokes = [...brushStrokes];
+      const stroke = { ...newStrokes[editingPolygonIndex] };
+      stroke.points = [...stroke.points];
+      stroke.points[editingPointIndex] = { x, y };
+      newStrokes[editingPolygonIndex] = stroke;
+      setBrushStrokes(newStrokes);
+      brushStrokesRef.current = newStrokes;
     }
-  }, [presenterMode, presenterIsDragging, presenterSubMode, presenterDragMode, currentStroke, originalImage, regions, cv, presenterSelectionRadius]);
+  }, [presenterMode, presenterIsDragging, presenterSubMode, presenterDragMode, currentStroke, originalImage, regions, cv, presenterSelectionRadius, editingPolygonIndex, editingPointIndex, brushStrokes]);
 
   /**
    * Presenter mode: Handle mouse leave
@@ -1818,8 +1981,13 @@ function App() {
         setCurrentStroke(null);
         pushHistory(regions, newStrokes);
       }
+    } else if (presenterSubMode === 'polygon-edit' && editingPolygonIndex !== null) {
+      // Finished dragging polygon vertex - push history
+      pushHistory(regions, brushStrokes);
+      setEditingPolygonIndex(null);
+      setEditingPointIndex(null);
     }
-  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes, regions, pushHistory]);
+  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes, regions, pushHistory, editingPolygonIndex]);
 
   // Show loading state while OpenCV loads
   if (cvLoading) {
@@ -2070,7 +2238,7 @@ function App() {
               }}
             />
 
-            {/* Mode indicator */}
+            {/* Mode indicator - hides when cursor is near it */}
             <div style={{
               position: 'absolute',
               top: '20px',
@@ -2080,6 +2248,9 @@ function App() {
               padding: '15px 20px',
               borderRadius: '8px',
               fontFamily: 'monospace',
+              opacity: presenterMousePos && presenterMousePos.x < 320 && presenterMousePos.y < 400 ? 0 : 1,
+              transition: 'opacity 0.15s',
+              pointerEvents: 'none',
               fontSize: '14px',
               zIndex: 10000,
               border: transformMode ? '3px solid yellow' : 'none'
@@ -2116,6 +2287,8 @@ function App() {
                       presenterSubMode === 'segment' ? 'Segment Selection' :
                       presenterSubMode === 'brush-white' ? 'White Brush' :
                       presenterSubMode === 'brush-black' ? 'Black Brush' :
+                      presenterSubMode === 'polygon' ? `Polygon (${polygonColor})` :
+                      presenterSubMode === 'polygon-edit' ? 'Polygon Edit' :
                       'Eraser'
                     }
                   </div>
@@ -2125,6 +2298,8 @@ function App() {
                     <div><kbd>B</kbd> Black Brush</div>
                     <div><kbd>E</kbd> Eraser</div>
                     <div><kbd>O</kbd> Image Overlay {showImageOverlay ? '(ON)' : '(off)'}</div>
+                    <div><kbd>P</kbd> Polygon Tool</div>
+                    <div><kbd>D</kbd> Polygon Edit</div>
                     <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)' }}>
                       <kbd>Z</kbd> Smaller {presenterSubMode === 'segment' ? 'Radius' : 'Brush'}
                     </div>
@@ -2190,6 +2365,9 @@ function App() {
                 color: 'white',
                 padding: '15px 20px',
                 borderRadius: '8px',
+                opacity: presenterMousePos && presenterMousePos.x > window.innerWidth - 280 && presenterMousePos.y < 200 ? 0 : 1,
+                transition: 'opacity 0.15s',
+                pointerEvents: 'none',
                 fontFamily: 'monospace',
                 fontSize: '14px',
                 zIndex: 10000
