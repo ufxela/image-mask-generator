@@ -853,35 +853,32 @@ export function findRegionsInRadius(x, y, radius, regions) {
 
     // If the bounding box intersects the circle, check mask pixels
     if (distanceSquared <= scaledRadius * scaledRadius) {
-      // Sample points around the center within the region to see if any are in the mask
       let found = false;
 
-      // Check center point first
-      const localX = Math.floor(scaledX - bounds.x);
-      const localY = Math.floor(scaledY - bounds.y);
+      // Check the overlap region between the circle and the bounding box
+      const overlapMinX = Math.max(bounds.x, Math.floor(scaledX - scaledRadius));
+      const overlapMaxX = Math.min(bounds.x + bounds.width - 1, Math.ceil(scaledX + scaledRadius));
+      const overlapMinY = Math.max(bounds.y, Math.floor(scaledY - scaledRadius));
+      const overlapMaxY = Math.min(bounds.y + bounds.height - 1, Math.ceil(scaledY + scaledRadius));
 
-      if (localX >= 0 && localX < region.mask.cols &&
-          localY >= 0 && localY < region.mask.rows) {
-        if (region.mask.ucharAt(localY, localX) > 0) {
-          found = true;
-        }
-      }
+      // Sample the overlap area - step through at intervals for performance
+      const overlapW = overlapMaxX - overlapMinX;
+      const overlapH = overlapMaxY - overlapMinY;
+      const step = Math.max(1, Math.floor(Math.min(overlapW, overlapH) / 8));
 
-      // If center isn't in mask, sample around the perimeter of the radius
-      if (!found) {
-        const samples = 8; // Sample 8 points around the circle
-        for (let angle = 0; angle < Math.PI * 2; angle += (Math.PI * 2) / samples) {
-          const sampleX = Math.floor(scaledX + Math.cos(angle) * scaledRadius * 0.5);
-          const sampleY = Math.floor(scaledY + Math.sin(angle) * scaledRadius * 0.5);
+      for (let sy = overlapMinY; sy <= overlapMaxY && !found; sy += step) {
+        for (let sx = overlapMinX; sx <= overlapMaxX && !found; sx += step) {
+          // Check if this point is within the circle
+          const dx = sx - scaledX;
+          const dy = sy - scaledY;
+          if (dx * dx + dy * dy > scaledRadius * scaledRadius) continue;
 
-          const sLocalX = Math.floor(sampleX - bounds.x);
-          const sLocalY = Math.floor(sampleY - bounds.y);
-
-          if (sLocalX >= 0 && sLocalX < region.mask.cols &&
-              sLocalY >= 0 && sLocalY < region.mask.rows) {
-            if (region.mask.ucharAt(sLocalY, sLocalX) > 0) {
+          // Check if this point is in the region's mask
+          const lx = sx - bounds.x;
+          const ly = sy - bounds.y;
+          if (lx >= 0 && lx < region.mask.cols && ly >= 0 && ly < region.mask.rows) {
+            if (region.mask.ucharAt(ly, lx) > 0) {
               found = true;
-              break;
             }
           }
         }
