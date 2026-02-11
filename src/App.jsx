@@ -56,6 +56,7 @@ function App() {
   const [presenterMousePos, setPresenterMousePos] = useState(null); // {x, y, imgX, imgY} for hover preview
   const [presenterSelectionRadius, setPresenterSelectionRadius] = useState(30); // Radius for segment selection in presenter mode
   const [presenterDragMode, setPresenterDragMode] = useState(null); // 'select' or 'deselect' - set on mousedown, maintained during drag
+  const [showImageOverlay, setShowImageOverlay] = useState(false); // Toggle original image overlay in presenter mode
 
   // Transform mode state
   const [transformMode, setTransformMode] = useState(false);
@@ -264,7 +265,10 @@ function App() {
         regionsRef.current = newRegions;
 
         // Reset undo/redo history for new segmentation
-        const initialSnapshot = newRegions.map(r => r.selected);
+        const initialSnapshot = {
+          selections: newRegions.map(r => r.selected),
+          brushStrokes: []
+        };
         setSelectionHistory([initialSnapshot]);
         setHistoryIndex(0);
 
@@ -294,10 +298,14 @@ function App() {
   }, [originalImage, detailLevel, mergeStrength, cv, regions]);
 
   /**
-   * Push the current selection state onto the undo history
+   * Push the current state onto the undo history
+   * Tracks both region selections and brush strokes
    */
-  const pushSelectionHistory = useCallback((currentRegions) => {
-    const snapshot = currentRegions.map(r => r.selected);
+  const pushHistory = useCallback((currentRegions, currentBrushStrokes) => {
+    const snapshot = {
+      selections: currentRegions.map(r => r.selected),
+      brushStrokes: JSON.parse(JSON.stringify(currentBrushStrokes))
+    };
     setSelectionHistory(prev => {
       const truncated = prev.slice(0, historyIndex + 1);
       const newHistory = [...truncated, snapshot];
@@ -308,40 +316,62 @@ function App() {
   }, [historyIndex]);
 
   /**
-   * Undo the last selection change
+   * Undo the last change (selection or brush stroke)
    */
   const undo = useCallback(() => {
-    if (historyIndex <= 0 || selectionHistory.length === 0 || regions.length === 0) return;
+    if (historyIndex <= 0 || selectionHistory.length === 0) return;
     const newIndex = historyIndex - 1;
     const snapshot = selectionHistory[newIndex];
-    if (!snapshot || snapshot.length !== regions.length) return;
-    const newRegions = regions.map((r, i) => ({ ...r, selected: snapshot[i] || false }));
-    setRegions(newRegions);
-    regionsRef.current = newRegions;
-    setHistoryIndex(newIndex);
-    if (originalImage && cv) {
-      drawSegmentation(originalImage, newRegions, segmentationCanvasRef.current, -1, cv);
-      createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+    if (!snapshot) return;
+
+    // Restore selections if they match
+    if (snapshot.selections && snapshot.selections.length === regions.length) {
+      const newRegions = regions.map((r, i) => ({ ...r, selected: snapshot.selections[i] || false }));
+      setRegions(newRegions);
+      regionsRef.current = newRegions;
+      if (originalImage && cv) {
+        drawSegmentation(originalImage, newRegions, segmentationCanvasRef.current, -1, cv);
+        createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+      }
     }
+
+    // Restore brush strokes
+    if (snapshot.brushStrokes !== undefined) {
+      const restoredStrokes = JSON.parse(JSON.stringify(snapshot.brushStrokes));
+      setBrushStrokes(restoredStrokes);
+      brushStrokesRef.current = restoredStrokes;
+    }
+
+    setHistoryIndex(newIndex);
     setStatus({ message: 'Undo', type: 'info' });
   }, [historyIndex, selectionHistory, regions, originalImage, cv]);
 
   /**
-   * Redo a previously undone selection change
+   * Redo a previously undone change
    */
   const redo = useCallback(() => {
-    if (historyIndex >= selectionHistory.length - 1 || regions.length === 0) return;
+    if (historyIndex >= selectionHistory.length - 1) return;
     const newIndex = historyIndex + 1;
     const snapshot = selectionHistory[newIndex];
-    if (!snapshot || snapshot.length !== regions.length) return;
-    const newRegions = regions.map((r, i) => ({ ...r, selected: snapshot[i] || false }));
-    setRegions(newRegions);
-    regionsRef.current = newRegions;
-    setHistoryIndex(newIndex);
-    if (originalImage && cv) {
-      drawSegmentation(originalImage, newRegions, segmentationCanvasRef.current, -1, cv);
-      createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+    if (!snapshot) return;
+
+    if (snapshot.selections && snapshot.selections.length === regions.length) {
+      const newRegions = regions.map((r, i) => ({ ...r, selected: snapshot.selections[i] || false }));
+      setRegions(newRegions);
+      regionsRef.current = newRegions;
+      if (originalImage && cv) {
+        drawSegmentation(originalImage, newRegions, segmentationCanvasRef.current, -1, cv);
+        createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+      }
     }
+
+    if (snapshot.brushStrokes !== undefined) {
+      const restoredStrokes = JSON.parse(JSON.stringify(snapshot.brushStrokes));
+      setBrushStrokes(restoredStrokes);
+      brushStrokesRef.current = restoredStrokes;
+    }
+
+    setHistoryIndex(newIndex);
     setStatus({ message: 'Redo', type: 'info' });
   }, [historyIndex, selectionHistory, regions, originalImage, cv]);
 
@@ -438,7 +468,7 @@ function App() {
       regionsRef.current = newRegions;
       drawSegmentation(originalImage, newRegions, segmentationCanvasRef.current, regionIndex, cv);
       createMask(originalImage, newRegions, maskCanvasRef.current, cv);
-      pushSelectionHistory(newRegions);
+      pushHistory(newRegions, brushStrokes);
       setStatus({ message: `Selected ${toSelect.length} similar connected regions`, type: 'info' });
       return;
     }
@@ -463,7 +493,7 @@ function App() {
       // Automatically update mask
       createMask(originalImage, newRegions, maskCanvasRef.current, cv);
     }
-  }, [regions, originalImage, cv, mergeStrength, pushSelectionHistory]);
+  }, [regions, originalImage, cv, mergeStrength, pushHistory, brushStrokes]);
 
   /**
    * Handle mouse up on segmentation canvas to end drag selection
@@ -472,11 +502,11 @@ function App() {
     if (!isDragging) return;
 
     setIsDragging(false);
-    pushSelectionHistory(regions);
+    pushHistory(regions, brushStrokes);
 
     const selectedCount = regions.filter(r => r.selected).length;
     setStatus({ message: `${selectedCount} region(s) selected`, type: 'info' });
-  }, [isDragging, regions, pushSelectionHistory]);
+  }, [isDragging, regions, pushHistory, brushStrokes]);
 
   /**
    * Clear all region selections
@@ -485,7 +515,7 @@ function App() {
     const newRegions = regions.map(r => ({ ...r, selected: false }));
     setRegions(newRegions);
     regionsRef.current = newRegions;
-    pushSelectionHistory(newRegions);
+    pushHistory(newRegions, brushStrokes);
     drawSegmentation(
       originalImage,
       newRegions,
@@ -501,7 +531,7 @@ function App() {
     ctx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
 
     setStatus({ message: 'Selection cleared.', type: 'info' });
-  }, [regions, originalImage, cv, pushSelectionHistory]);
+  }, [regions, originalImage, cv, pushHistory, brushStrokes]);
 
 
   /**
@@ -729,6 +759,17 @@ function App() {
     // Draw the mask scaled to fit
     ctx.drawImage(tempCanvas, offsetX, offsetY, displayWidth, displayHeight);
 
+    // Optionally overlay the original image at low opacity (toggled with 'O' key)
+    if (showImageOverlay) {
+      const imgCanvas = document.createElement('canvas');
+      imgCanvas.width = originalImage.cols;
+      imgCanvas.height = originalImage.rows;
+      cv.imshow(imgCanvas, originalImage);
+      ctx.globalAlpha = 0.25;
+      ctx.drawImage(imgCanvas, offsetX, offsetY, displayWidth, displayHeight);
+      ctx.globalAlpha = 1.0;
+    }
+
     // Apply brush strokes overlay
     if (brushStrokes.length > 0 || currentStroke) {
       const allStrokes = currentStroke ? [...brushStrokes, currentStroke] : brushStrokes;
@@ -900,7 +941,7 @@ function App() {
     }
 
     return { displayWidth, displayHeight, offsetX, offsetY };
-  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize, transformMode, transformPoints, homographyMatrix, presenterMousePos, presenterSubMode, presenterSelectionRadius]);
+  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize, transformMode, transformPoints, homographyMatrix, presenterMousePos, presenterSubMode, presenterSelectionRadius, showImageOverlay]);
 
   /**
    * Save the current state as the base (untransformed) state
@@ -1387,6 +1428,11 @@ function App() {
             setPresenterSubMode('eraser');
           }
           break;
+        case 'o':
+          if (!transformMode) {
+            setShowImageOverlay(prev => !prev);
+          }
+          break;
         case 'z':
           if ((e.ctrlKey || e.metaKey) && !transformMode) {
             e.preventDefault();
@@ -1465,7 +1511,7 @@ function App() {
     if (presenterMode) {
       renderPresenterCanvas();
     }
-  }, [presenterMode, regions, brushStrokes, currentStroke, transformMode, transformPoints, renderPresenterCanvas]);
+  }, [presenterMode, regions, brushStrokes, currentStroke, transformMode, transformPoints, renderPresenterCanvas, showImageOverlay]);
 
   // Presenter mode: Handle window resize
   useEffect(() => {
@@ -1731,7 +1777,7 @@ function App() {
 
     // Push undo history for segment mode
     if (presenterSubMode === 'segment' && regions.length > 0) {
-      pushSelectionHistory(regions);
+      pushHistory(regions, brushStrokes);
     }
 
     if (presenterSubMode === 'brush-white' || presenterSubMode === 'brush-black') {
@@ -1741,6 +1787,7 @@ function App() {
         setBrushStrokes(newStrokes);
         brushStrokesRef.current = newStrokes;
         setCurrentStroke(null);
+        pushHistory(regions, newStrokes);
       }
     } else if (presenterSubMode === 'eraser') {
       // Erase strokes that intersect with the eraser path
@@ -1769,9 +1816,10 @@ function App() {
         setBrushStrokes(newStrokes);
         brushStrokesRef.current = newStrokes;
         setCurrentStroke(null);
+        pushHistory(regions, newStrokes);
       }
     }
-  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes, regions, pushSelectionHistory]);
+  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes, regions, pushHistory]);
 
   // Show loading state while OpenCV loads
   if (cvLoading) {
@@ -2076,6 +2124,7 @@ function App() {
                     <div><kbd>W</kbd> White Brush</div>
                     <div><kbd>B</kbd> Black Brush</div>
                     <div><kbd>E</kbd> Eraser</div>
+                    <div><kbd>O</kbd> Image Overlay {showImageOverlay ? '(ON)' : '(off)'}</div>
                     <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)' }}>
                       <kbd>Z</kbd> Smaller {presenterSubMode === 'segment' ? 'Radius' : 'Brush'}
                     </div>
