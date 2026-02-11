@@ -2095,24 +2095,62 @@ function App() {
 
       const numPts = segEditOriginalPoints.length;
       const sigma = segEditInfluenceRadius / 2;
+
+      // Compute per-point deltas for the edited region
+      const pointDeltas = [];
       const newContour = new cv.Mat(numPts, 1, cv.CV_32SC2);
 
       for (let i = 0; i < numPts; i++) {
-        // Distance along contour from the dragged point (wrapping)
         let dAlong = Math.abs(i - segEditPointIndex);
         dAlong = Math.min(dAlong, numPts - dAlong);
-
         const weight = Math.exp(-(dAlong * dAlong) / (2 * sigma * sigma));
-
-        newContour.data32S[i * 2] = Math.round(segEditOriginalPoints[i].x + deltaX * weight);
-        newContour.data32S[i * 2 + 1] = Math.round(segEditOriginalPoints[i].y + deltaY * weight);
+        const dx = deltaX * weight;
+        const dy = deltaY * weight;
+        pointDeltas.push({ ox: segEditOriginalPoints[i].x, oy: segEditOriginalPoints[i].y, dx, dy });
+        newContour.data32S[i * 2] = Math.round(segEditOriginalPoints[i].x + dx);
+        newContour.data32S[i * 2 + 1] = Math.round(segEditOriginalPoints[i].y + dy);
       }
 
-      // Update region contour (replace old one)
       const newRegions = [...regions];
       const oldContour = newRegions[segEditRegionIndex].contour;
       newRegions[segEditRegionIndex] = { ...newRegions[segEditRegionIndex], contour: newContour };
       if (oldContour && !oldContour.isDeleted()) oldContour.delete();
+
+      // Move shared boundary points on adjacent regions to avoid voids
+      const adjacentIndices = region.adjacentIndices || [];
+      const proximityThreshold = 4; // pixels in downscaled space
+      for (const adjIdx of adjacentIndices) {
+        const adjRegion = newRegions[adjIdx];
+        const adjContour = adjRegion.contour;
+        let modified = false;
+        const adjNew = adjContour.clone();
+
+        for (let ai = 0; ai < adjContour.rows; ai++) {
+          const ax = adjContour.data32S[ai * 2];
+          const ay = adjContour.data32S[ai * 2 + 1];
+
+          // Check if this adjacent point was near any of the original moved points
+          for (const pd of pointDeltas) {
+            if (Math.abs(pd.dx) < 0.5 && Math.abs(pd.dy) < 0.5) continue;
+            const dist = Math.sqrt((ax - pd.ox) ** 2 + (ay - pd.oy) ** 2);
+            if (dist < proximityThreshold) {
+              adjNew.data32S[ai * 2] = Math.round(ax + pd.dx);
+              adjNew.data32S[ai * 2 + 1] = Math.round(ay + pd.dy);
+              modified = true;
+              break;
+            }
+          }
+        }
+
+        if (modified) {
+          const oldAdj = newRegions[adjIdx].contour;
+          newRegions[adjIdx] = { ...newRegions[adjIdx], contour: adjNew };
+          if (oldAdj && !oldAdj.isDeleted()) oldAdj.delete();
+        } else {
+          adjNew.delete();
+        }
+      }
+
       setRegions(newRegions);
       regionsRef.current = newRegions;
     }
@@ -2260,6 +2298,12 @@ function App() {
 
       // Rebuild mask from modified contour
       rebuildRegionMask(region, cv);
+
+      // Also rebuild masks for any adjacent regions that had shared boundary points moved
+      const adjacentIndices = region.adjacentIndices || [];
+      for (const adjIdx of adjacentIndices) {
+        rebuildRegionMask(regions[adjIdx], cv);
+      }
 
       // Update canvases
       if (originalImage) {
