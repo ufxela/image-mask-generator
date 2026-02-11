@@ -1959,33 +1959,59 @@ function App() {
         pushHistory(regions, newStrokes);
       }
     } else if (presenterSubMode === 'eraser') {
-      // Erase strokes that intersect with the eraser path
+      // Erase strokes/polygons that intersect with the eraser path
       if (currentStroke && currentStroke.points.length > 0) {
         const eraserPoints = currentStroke.points;
-        const eraserRadius = currentStroke.size / 2; // Use the eraser's stored size
+        const eraserRadius = currentStroke.size / 2;
 
-        // Filter out strokes that intersect with eraser
         const newStrokes = brushStrokes.filter(stroke => {
+          // For polygons: check vertex proximity and point-in-polygon
+          if (stroke.type === 'polygon-white' || stroke.type === 'polygon-black') {
+            for (const eraserPoint of eraserPoints) {
+              // Check proximity to any vertex
+              for (const pt of stroke.points) {
+                const dx = pt.x - eraserPoint.x;
+                const dy = pt.y - eraserPoint.y;
+                if (Math.sqrt(dx * dx + dy * dy) < eraserRadius + 10) {
+                  return false;
+                }
+              }
+              // Ray casting: check if eraser point is inside the polygon
+              let inside = false;
+              const pts = stroke.points;
+              for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+                if (((pts[i].y > eraserPoint.y) !== (pts[j].y > eraserPoint.y)) &&
+                    (eraserPoint.x < (pts[j].x - pts[i].x) * (eraserPoint.y - pts[i].y) / (pts[j].y - pts[i].y) + pts[i].x)) {
+                  inside = !inside;
+                }
+              }
+              if (inside) return false;
+            }
+            return true;
+          }
+
+          // For brush strokes: check point distance
           const strokeRadius = stroke.size / 2;
-          // Check if any point in the stroke intersects with any eraser point
           for (const strokePoint of stroke.points) {
             for (const eraserPoint of eraserPoints) {
               const dx = strokePoint.x - eraserPoint.x;
               const dy = strokePoint.y - eraserPoint.y;
-              const distance = Math.sqrt(dx * dx + dy * dy);
-
-              if (distance < eraserRadius + strokeRadius) {
-                return false; // Remove this stroke
+              if (Math.sqrt(dx * dx + dy * dy) < eraserRadius + strokeRadius) {
+                return false;
               }
             }
           }
-          return true; // Keep this stroke
+          return true;
         });
 
-        setBrushStrokes(newStrokes);
-        brushStrokesRef.current = newStrokes;
         setCurrentStroke(null);
-        pushHistory(regions, newStrokes);
+
+        // Only push to history if something was actually erased
+        if (newStrokes.length < brushStrokes.length) {
+          setBrushStrokes(newStrokes);
+          brushStrokesRef.current = newStrokes;
+          pushHistory(regions, newStrokes);
+        }
       }
     } else if (presenterSubMode === 'polygon-edit' && editingPolygonIndex !== null) {
       // Finished dragging polygon vertex - push history
