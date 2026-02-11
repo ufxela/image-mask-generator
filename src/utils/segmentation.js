@@ -841,6 +841,16 @@ export function findRegionsInRadius(x, y, radius, regions) {
     const scaledY = y * scaleFactor;
     const scaledRadius = radius * scaleFactor;
 
+    // Always include the region directly under the cursor
+    const localCursorX = Math.floor(scaledX - bounds.x);
+    const localCursorY = Math.floor(scaledY - bounds.y);
+    if (localCursorX >= 0 && localCursorX < region.mask.cols &&
+        localCursorY >= 0 && localCursorY < region.mask.rows &&
+        region.mask.ucharAt(localCursorY, localCursorX) > 0) {
+      foundRegions.push(i);
+      continue;
+    }
+
     // Check if the region's bounding box intersects with the circle
     // Find the closest point on the bounding box to the circle center
     const closestX = Math.max(bounds.x, Math.min(scaledX, bounds.x + bounds.width));
