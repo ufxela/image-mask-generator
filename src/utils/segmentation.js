@@ -410,9 +410,27 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
       labels.forEach((label, idx) => labelToIndex.set(label, idx));
 
       const uf = new UnionFind(labels.length);
-      // Track pixel count per union-find group to prevent oversized merges
+      // Track pixel count and bounding box per union-find group to prevent oversized merges
       const groupSize = labels.map(label => regionPoints.get(label).length);
       const maxMergedArea = workingImage.cols * workingImage.rows * 0.03; // 3% of image max
+      const maxMergedWidth = Math.floor(workingImage.cols / regionSize);
+      const maxMergedHeight = Math.floor(workingImage.rows / regionSize);
+
+      // Track bounding boxes per group
+      const groupBounds = labels.map(label => {
+        const points = regionPoints.get(label);
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        // Sample points for speed
+        const step = Math.max(1, Math.floor(points.length / 100));
+        for (let i = 0; i < points.length; i += step) {
+          const pt = points[i];
+          if (pt.x < minX) minX = pt.x;
+          if (pt.x > maxX) maxX = pt.x;
+          if (pt.y < minY) minY = pt.y;
+          if (pt.y > maxY) maxY = pt.y;
+        }
+        return { minX, minY, maxX, maxY };
+      });
 
       for (const pairKey of adjacencySet) {
         const sepIdx = pairKey.indexOf('_');
@@ -440,10 +458,20 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
             if (rootA !== rootB) {
               // Don't merge if combined size would be too large
               if (groupSize[rootA] + groupSize[rootB] > maxMergedArea) continue;
+              // Don't merge if combined bounding box would be too wide or tall
+              const combinedBounds = {
+                minX: Math.min(groupBounds[rootA].minX, groupBounds[rootB].minX),
+                minY: Math.min(groupBounds[rootA].minY, groupBounds[rootB].minY),
+                maxX: Math.max(groupBounds[rootA].maxX, groupBounds[rootB].maxX),
+                maxY: Math.max(groupBounds[rootA].maxY, groupBounds[rootB].maxY),
+              };
+              if (combinedBounds.maxX - combinedBounds.minX > maxMergedWidth) continue;
+              if (combinedBounds.maxY - combinedBounds.minY > maxMergedHeight) continue;
               uf.union(idxA, idxB);
-              // Update group size on the new root
+              // Update group size and bounds on the new root
               const newRoot = uf.find(idxA);
               groupSize[newRoot] = groupSize[rootA] + groupSize[rootB];
+              groupBounds[newRoot] = combinedBounds;
             }
           }
         }
