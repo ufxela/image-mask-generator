@@ -165,7 +165,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     const markerCount = markerLabel - 1;
     console.log(`[Segmentation] Created ${markerCount} markers`);
 
-    if (markerCount > 5000) {
+    if (markerCount > 10000) {
       throw new Error(`Too many markers (${markerCount}). Try reducing detail level.`);
     }
 
@@ -413,8 +413,8 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
       // Track pixel count and bounding box per union-find group to prevent oversized merges
       const groupSize = labels.map(label => regionPoints.get(label).length);
       const maxMergedArea = workingImage.cols * workingImage.rows * 0.03; // 3% of image max
-      const maxMergedWidth = Math.floor(workingImage.cols / regionSize);
-      const maxMergedHeight = Math.floor(workingImage.rows / regionSize);
+      const maxMergedWidth = Math.floor(workingImage.cols / 40);
+      const maxMergedHeight = Math.floor(workingImage.rows / 40);
 
       // Track bounding boxes per group
       const groupBounds = labels.map(label => {
