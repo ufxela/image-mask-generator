@@ -119,19 +119,20 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     cv.normalize(gradient, gradient, 0, 255, cv.NORM_MINMAX);
     gradient.convertTo(gradient, cv.CV_8U);
 
-    // Single Canny pass on bilateral-filtered image for thin edge detection
-    const canny = new cv.Mat();
-    cv.Canny(blurred, canny, 50, 150);
+    // Single Canny pass on bilateral-filtered image for the Step 1 combined map
+    const cannyStep1 = new cv.Mat();
+    cv.Canny(blurred, cannyStep1, 50, 150);
 
-    // Combine Sobel + Canny for the watershed barrier image (used in Step 3)
-    const combined = new cv.Mat();
-    cv.max(gradient, canny, combined);
-    canny.delete();
+    // This is the basic combined map — will be enhanced in Step 1.5
+    const combinedBasic = new cv.Mat();
+    cv.max(gradient, cannyStep1, combinedBasic);
+    cannyStep1.delete();
 
     console.log('[Segmentation] Edge detection complete');
 
     // Save edge map for other features
-    edgeMap = combined.clone();
+    edgeMap = combinedBasic.clone();
+    combinedBasic.delete();
 
     const imgCols = workingImage.cols;
     const imgRows = workingImage.rows;
@@ -150,21 +151,37 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     const cannyR = new cv.Mat();
     const cannyG = new cv.Mat();
     const cannyB = new cv.Mat();
-    cv.Canny(channels.get(0), cannyR, 20, 70); // Red channel
-    cv.Canny(channels.get(1), cannyG, 20, 70); // Green channel
-    cv.Canny(channels.get(2), cannyB, 20, 70); // Blue channel
+    cv.Canny(channels.get(0), cannyR, 15, 50); // Lower thresholds for text
+    cv.Canny(channels.get(1), cannyG, 15, 50);
+    cv.Canny(channels.get(2), cannyB, 15, 50);
     channels.delete();
 
-    // Combine all edge sources: gradient + grayscale Canny + color Canny
-    const edgeMaskInput = new cv.Mat();
-    cv.max(gradient, cannyGray, edgeMaskInput);
-    cv.max(edgeMaskInput, cannyR, edgeMaskInput);
-    cv.max(edgeMaskInput, cannyG, edgeMaskInput);
-    cv.max(edgeMaskInput, cannyB, edgeMaskInput);
+    // Combine all Canny edges first, then close gaps
+    const cannyAll = new cv.Mat();
+    cv.max(cannyGray, cannyR, cannyAll);
+    cv.max(cannyAll, cannyG, cannyAll);
+    cv.max(cannyAll, cannyB, cannyAll);
     cannyGray.delete();
     cannyR.delete();
     cannyG.delete();
     cannyB.delete();
+
+    // Morphological close: seal gaps in edge chains for the WATERSHED BARRIER
+    // (Not used in the edge mask — we want thin edges for precise distance transform)
+    const closeKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+    const cannyClosed = new cv.Mat();
+    cv.morphologyEx(cannyAll, cannyClosed, cv.MORPH_CLOSE, closeKernel);
+    closeKernel.delete();
+
+    // Edge mask input: gradient + RAW Canny (thin, precise for distance transform)
+    const edgeMaskInput = new cv.Mat();
+    cv.max(gradient, cannyAll, edgeMaskInput);
+    cannyAll.delete();
+
+    // Watershed barrier: gradient + CLOSED Canny (thick, leak-proof for watershed)
+    const combined = new cv.Mat();
+    cv.max(gradient, cannyClosed, combined);
+    cannyClosed.delete();
 
     const edgeMask = new cv.Mat();
     cv.threshold(edgeMaskInput, edgeMask, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
@@ -252,12 +269,27 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     fgContours.delete();
 
     // Add supplementary grid markers to subdivide large uniform areas
+    // Only place markers where there are NO edges nearby (to avoid straddling feature boundaries)
     let nextLabel = markerCount + 1;
-    const maxGap = Math.max(8, Math.round(Math.min(imgCols, imgRows) / 60)); // ~12px - enforces small segments
+    const maxGap = Math.max(8, Math.round(Math.min(imgCols, imgRows) / 60));
+    const combinedEdgeData = combined.data;
     let supplementary = 0;
     for (let y = Math.floor(maxGap / 2); y < imgRows; y += maxGap) {
       for (let x = Math.floor(maxGap / 2); x < imgCols; x += maxGap) {
-        if (markerGrid[y * imgCols + x] === 0) { // Only place where no marker exists at this exact pixel
+        if (markerGrid[y * imgCols + x] !== 0) continue;
+
+        // Check if any edge exists within 2px radius
+        let nearEdge = false;
+        for (let dy = -2; dy <= 2 && !nearEdge; dy++) {
+          for (let dx = -2; dx <= 2 && !nearEdge; dx++) {
+            const nx = x + dx, ny = y + dy;
+            if (nx >= 0 && nx < imgCols && ny >= 0 && ny < imgRows) {
+              if (combinedEdgeData[ny * imgCols + nx] > 30) nearEdge = true;
+            }
+          }
+        }
+
+        if (!nearEdge) {
           markerGrid[y * imgCols + x] = nextLabel++;
           supplementary++;
         }
