@@ -138,8 +138,28 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     const imgRows = workingImage.rows;
 
     // Step 1.5: Create binary edge mask
-    // Use gradient + Canny on grayscale AND individual color channels for text detection
     console.log('[Segmentation] Step 1.5: Creating binary edge mask');
+
+    // Compute color gradient: max channel difference across neighbors
+    // This catches color-only edges (e.g. red text on white) that grayscale misses
+    const colorImgData = workingImage.data;
+    const colorGrad = new cv.Mat(imgRows, imgCols, cv.CV_8U);
+    const colorGradData = colorGrad.data;
+    for (let y = 1; y < imgRows - 1; y++) {
+      for (let x = 1; x < imgCols - 1; x++) {
+        const idx = (y * imgCols + x) * 4;
+        let maxDiff = 0;
+        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+          const nIdx = ((y+dy) * imgCols + (x+dx)) * 4;
+          const dr = Math.abs(colorImgData[idx] - colorImgData[nIdx]);
+          const dg = Math.abs(colorImgData[idx+1] - colorImgData[nIdx+1]);
+          const db = Math.abs(colorImgData[idx+2] - colorImgData[nIdx+2]);
+          const d = Math.max(dr, dg, db);
+          if (d > maxDiff) maxDiff = d;
+        }
+        colorGradData[y * imgCols + x] = Math.min(255, maxDiff);
+      }
+    }
 
     // Canny on raw grayscale
     const cannyGray = new cv.Mat();
@@ -151,8 +171,9 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     const cannyR = new cv.Mat();
     const cannyG = new cv.Mat();
     const cannyB = new cv.Mat();
-    cv.Canny(channels.get(0), cannyR, 15, 50); // Lower thresholds for text
+    cv.Canny(channels.get(0), cannyR, 15, 50);
     cv.Canny(channels.get(1), cannyG, 15, 50);
+    cv.Canny(channels.get(2), cannyB, 15, 50);
     cv.Canny(channels.get(2), cannyB, 15, 50);
     channels.delete();
 
@@ -173,7 +194,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     cv.morphologyEx(cannyAll, cannyClosed, cv.MORPH_CLOSE, closeKernel);
     closeKernel.delete();
 
-    // Edge mask input: gradient + RAW Canny (thin, precise for distance transform)
+    // Edge mask: gradient + RAW Canny → Otsu threshold
     const edgeMaskInput = new cv.Mat();
     cv.max(gradient, cannyAll, edgeMaskInput);
     cannyAll.delete();
@@ -181,11 +202,19 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     // Watershed barrier: gradient + CLOSED Canny (thick, leak-proof for watershed)
     const combined = new cv.Mat();
     cv.max(gradient, cannyClosed, combined);
+    cv.max(combined, colorGrad, combined); // Include color edges in barriers too
     cannyClosed.delete();
 
     const edgeMask = new cv.Mat();
     cv.threshold(edgeMaskInput, edgeMask, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
     edgeMaskInput.delete();
+
+    // Add strong color edges AFTER Otsu — catches colored text regardless of threshold
+    const colorEdgeMask = new cv.Mat();
+    cv.threshold(colorGrad, colorEdgeMask, 40, 255, cv.THRESH_BINARY);
+    cv.max(edgeMask, colorEdgeMask, edgeMask);
+    colorEdgeMask.delete();
+    colorGrad.delete();
 
     let edgeCount = 0;
     for (let i = 0; i < imgCols * imgRows; i++) {
@@ -214,7 +243,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     // sensitivity=5 (default) → threshold=1.5
     // sensitivity=10 → threshold=1.1
     // sensitivity=20 → threshold=0.8
-    const rawThreshold = Math.max(0.8, 1.5 - (sensitivity - 1) * (0.7 / 19));
+    const rawThreshold = Math.max(0.8, 1.2 - (sensitivity - 1) * (0.4 / 19));
     console.log(`[Segmentation] Distance threshold: ${rawThreshold.toFixed(2)}px (sensitivity=${sensitivity})`);
 
     // Threshold distance transform to find region interiors
