@@ -119,47 +119,26 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     cv.normalize(gradient, gradient, 0, 255, cv.NORM_MINMAX);
     gradient.convertTo(gradient, cv.CV_8U);
 
-    // Single Canny pass on bilateral-filtered image for the Step 1 combined map
-    const cannyStep1 = new cv.Mat();
-    cv.Canny(blurred, cannyStep1, 50, 150);
+    // Single Canny pass on bilateral-filtered image for thin edge detection
+    const canny = new cv.Mat();
+    cv.Canny(blurred, canny, 50, 150);
 
-    // This is the basic combined map — will be enhanced in Step 1.5
-    const combinedBasic = new cv.Mat();
-    cv.max(gradient, cannyStep1, combinedBasic);
-    cannyStep1.delete();
+    // Combine Sobel + Canny for the watershed barrier image (used in Step 3)
+    const combined = new cv.Mat();
+    cv.max(gradient, canny, combined);
+    canny.delete();
 
     console.log('[Segmentation] Edge detection complete');
 
     // Save edge map for other features
-    edgeMap = combinedBasic.clone();
-    combinedBasic.delete();
+    edgeMap = combined.clone();
 
     const imgCols = workingImage.cols;
     const imgRows = workingImage.rows;
 
     // Step 1.5: Create binary edge mask
+    // Use gradient + Canny on grayscale AND individual color channels for text detection
     console.log('[Segmentation] Step 1.5: Creating binary edge mask');
-
-    // Compute color gradient: max channel difference across neighbors
-    // This catches color-only edges (e.g. red text on white) that grayscale misses
-    const colorImgData = workingImage.data;
-    const colorGrad = new cv.Mat(imgRows, imgCols, cv.CV_8U);
-    const colorGradData = colorGrad.data;
-    for (let y = 1; y < imgRows - 1; y++) {
-      for (let x = 1; x < imgCols - 1; x++) {
-        const idx = (y * imgCols + x) * 4;
-        let maxDiff = 0;
-        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
-          const nIdx = ((y+dy) * imgCols + (x+dx)) * 4;
-          const dr = Math.abs(colorImgData[idx] - colorImgData[nIdx]);
-          const dg = Math.abs(colorImgData[idx+1] - colorImgData[nIdx+1]);
-          const db = Math.abs(colorImgData[idx+2] - colorImgData[nIdx+2]);
-          const d = Math.max(dr, dg, db);
-          if (d > maxDiff) maxDiff = d;
-        }
-        colorGradData[y * imgCols + x] = Math.min(255, maxDiff);
-      }
-    }
 
     // Canny on raw grayscale
     const cannyGray = new cv.Mat();
@@ -171,50 +150,51 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     const cannyR = new cv.Mat();
     const cannyG = new cv.Mat();
     const cannyB = new cv.Mat();
-    cv.Canny(channels.get(0), cannyR, 15, 50);
-    cv.Canny(channels.get(1), cannyG, 15, 50);
-    cv.Canny(channels.get(2), cannyB, 15, 50);
-    cv.Canny(channels.get(2), cannyB, 15, 50);
+    cv.Canny(channels.get(0), cannyR, 20, 70); // Red channel
+    cv.Canny(channels.get(1), cannyG, 20, 70); // Green channel
+    cv.Canny(channels.get(2), cannyB, 20, 70); // Blue channel
     channels.delete();
 
-    // Combine all Canny edges first, then close gaps
-    const cannyAll = new cv.Mat();
-    cv.max(cannyGray, cannyR, cannyAll);
-    cv.max(cannyAll, cannyG, cannyAll);
-    cv.max(cannyAll, cannyB, cannyAll);
+    // Combine all edge sources: gradient + grayscale Canny + color Canny
+    const edgeMaskInput = new cv.Mat();
+    cv.max(gradient, cannyGray, edgeMaskInput);
+    cv.max(edgeMaskInput, cannyR, edgeMaskInput);
+    cv.max(edgeMaskInput, cannyG, edgeMaskInput);
+    cv.max(edgeMaskInput, cannyB, edgeMaskInput);
     cannyGray.delete();
     cannyR.delete();
     cannyG.delete();
     cannyB.delete();
 
-    // Morphological close: seal gaps in edge chains for the WATERSHED BARRIER
-    // (Not used in the edge mask — we want thin edges for precise distance transform)
-    const closeKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-    const cannyClosed = new cv.Mat();
-    cv.morphologyEx(cannyAll, cannyClosed, cv.MORPH_CLOSE, closeKernel);
-    closeKernel.delete();
-
-    // Edge mask: gradient + RAW Canny → Otsu threshold
-    const edgeMaskInput = new cv.Mat();
-    cv.max(gradient, cannyAll, edgeMaskInput);
-    cannyAll.delete();
-
-    // Watershed barrier: gradient + CLOSED Canny (thick, leak-proof for watershed)
-    const combined = new cv.Mat();
-    cv.max(gradient, cannyClosed, combined);
-    cv.max(combined, colorGrad, combined); // Include color edges in barriers too
-    cannyClosed.delete();
-
     const edgeMask = new cv.Mat();
     cv.threshold(edgeMaskInput, edgeMask, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
     edgeMaskInput.delete();
 
-    // Add strong color edges AFTER Otsu — catches colored text regardless of threshold
-    const colorEdgeMask = new cv.Mat();
-    cv.threshold(colorGrad, colorEdgeMask, 40, 255, cv.THRESH_BINARY);
-    cv.max(edgeMask, colorEdgeMask, edgeMask);
-    colorEdgeMask.delete();
-    colorGrad.delete();
+    // Add strong color edges AFTER Otsu to catch colored text (e.g. red on white)
+    // that Otsu's global threshold may miss
+    const colorImgData = workingImage.data;
+    const colorEdges = new cv.Mat(imgRows, imgCols, cv.CV_8U);
+    const colorEdgesData = colorEdges.data;
+    colorEdgesData.fill(0);
+    for (let y = 1; y < imgRows - 1; y++) {
+      for (let x = 1; x < imgCols - 1; x++) {
+        const idx = (y * imgCols + x) * 4;
+        let maxDiff = 0;
+        for (let d = 0; d < 4; d++) {
+          const offsets = [[1,0],[-1,0],[0,1],[0,-1]];
+          const nIdx = ((y + offsets[d][1]) * imgCols + (x + offsets[d][0])) * 4;
+          const diff = Math.max(
+            Math.abs(colorImgData[idx] - colorImgData[nIdx]),
+            Math.abs(colorImgData[idx+1] - colorImgData[nIdx+1]),
+            Math.abs(colorImgData[idx+2] - colorImgData[nIdx+2])
+          );
+          if (diff > maxDiff) maxDiff = diff;
+        }
+        if (maxDiff > 50) colorEdgesData[y * imgCols + x] = 255;
+      }
+    }
+    cv.max(edgeMask, colorEdges, edgeMask);
+    colorEdges.delete();
 
     let edgeCount = 0;
     for (let i = 0; i < imgCols * imgRows; i++) {
@@ -243,7 +223,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     // sensitivity=5 (default) → threshold=1.5
     // sensitivity=10 → threshold=1.1
     // sensitivity=20 → threshold=0.8
-    const rawThreshold = Math.max(0.8, 1.2 - (sensitivity - 1) * (0.4 / 19));
+    const rawThreshold = Math.max(0.8, 1.5 - (sensitivity - 1) * (0.7 / 19));
     console.log(`[Segmentation] Distance threshold: ${rawThreshold.toFixed(2)}px (sensitivity=${sensitivity})`);
 
     // Threshold distance transform to find region interiors
@@ -298,27 +278,12 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     fgContours.delete();
 
     // Add supplementary grid markers to subdivide large uniform areas
-    // Only place markers where there are NO edges nearby (to avoid straddling feature boundaries)
     let nextLabel = markerCount + 1;
-    const maxGap = Math.max(8, Math.round(Math.min(imgCols, imgRows) / 60));
-    const combinedEdgeData = combined.data;
+    const maxGap = Math.max(8, Math.round(Math.min(imgCols, imgRows) / 60)); // ~12px - enforces small segments
     let supplementary = 0;
     for (let y = Math.floor(maxGap / 2); y < imgRows; y += maxGap) {
       for (let x = Math.floor(maxGap / 2); x < imgCols; x += maxGap) {
-        if (markerGrid[y * imgCols + x] !== 0) continue;
-
-        // Check if any edge exists within 2px radius
-        let nearEdge = false;
-        for (let dy = -2; dy <= 2 && !nearEdge; dy++) {
-          for (let dx = -2; dx <= 2 && !nearEdge; dx++) {
-            const nx = x + dx, ny = y + dy;
-            if (nx >= 0 && nx < imgCols && ny >= 0 && ny < imgRows) {
-              if (combinedEdgeData[ny * imgCols + nx] > 30) nearEdge = true;
-            }
-          }
-        }
-
-        if (!nearEdge) {
+        if (markerGrid[y * imgCols + x] === 0) { // Only place where no marker exists at this exact pixel
           markerGrid[y * imgCols + x] = nextLabel++;
           supplementary++;
         }

@@ -2,26 +2,38 @@ const sharp = require('sharp');
 const path = require('path');
 
 async function main() {
+  console.log('Starting...');
+
+  // Load opencv-wasm
   const { cv } = require('opencv-wasm');
-  console.log('OpenCV loaded');
+  console.log('OpenCV loaded. cv.Mat:', typeof cv.Mat);
 
+  // Dynamically import segmentation.js (ES module)
   const seg = await import('./src/utils/segmentation.js');
+  console.log('Segmentation module loaded');
 
-  const inputPath = path.resolve('/Users/ufxela/image-mask-generator/test-collage.jpg');
-  const sensitivity = parseInt(process.argv[2] || '5');
+  // Load image
+  const inputPath = path.resolve(process.argv[2] || '/Users/ufxela/image-mask-generator/test-collage.jpg');
+  const outputPath = path.resolve(process.argv[3] || '/Users/ufxela/image-mask-generator/segmentation-result.png');
+  const sensitivity = parseInt(process.argv[4] || '5');
   const regionSize = Math.round(10 + (sensitivity - 1) * (70 / 19));
+  const mergeStrength = parseInt(process.argv[5] || '10');
 
   const { data, info } = await sharp(inputPath).raw().ensureAlpha().toBuffer({ resolveWithObject: true });
-  console.log(`Image: ${info.width}x${info.height}`);
+  console.log(`Image: ${info.width}x${info.height}, ${data.length} bytes`);
 
   const mat = new cv.Mat(info.height, info.width, cv.CV_8UC4);
   mat.data.set(data);
+  console.log(`Mat created: ${mat.rows}x${mat.cols}`);
 
-  const result = seg.segmentImage(mat, sensitivity, regionSize, cv, 10);
+  console.log(`Segmenting: sensitivity=${sensitivity}, regionSize=${regionSize}, merge=${mergeStrength}`);
+  const result = seg.segmentImage(mat, sensitivity, regionSize, cv, mergeStrength);
   console.log(`Result: ${result.regions.length} regions`);
 
-  // Build label map
+  // Build label map and draw red boundaries
+  const outputData = Buffer.from(data);
   const labelMap = new Int32Array(info.width * info.height).fill(-1);
+
   for (let ri = 0; ri < result.regions.length; ri++) {
     const region = result.regions[ri];
     const scale = 1 / (region.scaleFactor || 1);
@@ -40,8 +52,7 @@ async function main() {
     }
   }
 
-  // Draw boundaries as thin red lines
-  const outputData = Buffer.from(data);
+  let boundaryCount = 0;
   for (let y = 0; y < info.height; y++) {
     for (let x = 0; x < info.width; x++) {
       const label = labelMap[y * info.width + x];
@@ -58,20 +69,16 @@ async function main() {
       if (isBoundary) {
         const idx = (y * info.width + x) * 4;
         outputData[idx] = 255; outputData[idx+1] = 0; outputData[idx+2] = 0; outputData[idx+3] = 255;
+        boundaryCount++;
       }
     }
   }
 
-  // Save full result
-  await sharp(outputData, { raw: { width: info.width, height: info.height, channels: 4 } })
-    .png().toFile('/Users/ufxela/image-mask-generator/segmentation-result.png');
+  console.log(`Boundaries: ${boundaryCount} pixels (${(boundaryCount/(info.width*info.height)*100).toFixed(1)}%)`);
 
-  // Crop the "THE ART OF LIFE" text area (approximately center-left of image)
-  // The text appears to be around x:120-330, y:280-420 in the image
   await sharp(outputData, { raw: { width: info.width, height: info.height, channels: 4 } })
-    .extract({ left: 100, top: 260, width: 250, height: 180 })
-    .png().toFile('/Users/ufxela/image-mask-generator/text-crop.png');
-  console.log('Saved text-crop.png');
+    .png().toFile(outputPath);
+  console.log(`Saved: ${outputPath}`);
 
   // Cleanup
   mat.delete();
@@ -82,4 +89,4 @@ async function main() {
   }
 }
 
-main().catch(err => { console.error(err); process.exit(1); });
+main().catch(err => { console.error('FATAL:', err.message || err); process.exit(1); });
