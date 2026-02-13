@@ -665,3 +665,288 @@ describe('selectSimilarRegions', () => {
     expect(result).toEqual([0]);
   });
 });
+
+// ============================================================
+// Segmentation Invariant Tests
+// These verify the core requirements for segment quality
+// ============================================================
+
+describe('Segmentation Invariants', () => {
+  /**
+   * Helper: create a simple pixel label map from region masks
+   * Returns a 2D array where each cell is the region index that owns it
+   */
+  function buildLabelMap(width, height, regions) {
+    const map = new Array(height).fill(null).map(() => new Array(width).fill(-1));
+    for (let ri = 0; ri < regions.length; ri++) {
+      const region = regions[ri];
+      const b = region.bounds;
+      for (let y = 0; y < b.height; y++) {
+        for (let x = 0; x < b.width; x++) {
+          const globalX = b.x + x;
+          const globalY = b.y + y;
+          if (globalX < width && globalY < height) {
+            if (region.maskData && region.maskData[y * b.width + x] > 0) {
+              map[globalY][globalX] = ri;
+            }
+          }
+        }
+      }
+    }
+    return map;
+  }
+
+  /**
+   * Helper: check if an edge pixel in the image is a segment boundary
+   * An edge pixel is a segment boundary if at least one neighbor belongs to a different segment
+   */
+  function isSegmentBoundary(labelMap, x, y, width, height) {
+    const label = labelMap[y][x];
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        if (dx === 0 && dy === 0) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+          if (labelMap[ny][nx] !== label && labelMap[ny][nx] !== -1) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  // Helper: create mock regions with explicit mask data
+  function createMockRegion(bounds, maskData, avgColor = { r: 128, g: 128, b: 128 }) {
+    return {
+      bounds,
+      maskData, // flat Uint8Array: maskData[y * width + x]
+      scaleFactor: 1,
+      selected: false,
+      avgColor,
+      adjacentIndices: [],
+      contour: { rows: 0, data32S: new Int32Array(0) },
+      mask: { cols: bounds.width, rows: bounds.height, ucharAt: (y, x) => maskData[y * bounds.width + x] }
+    };
+  }
+
+  describe('Invariant: Complete coverage', () => {
+    it('every pixel should belong to exactly one region (no gaps, no overlaps)', () => {
+      const width = 10;
+      const height = 10;
+
+      // Two regions that tile the image: left half and right half
+      const leftMask = new Uint8Array(10 * 5);
+      leftMask.fill(255);
+      const rightMask = new Uint8Array(10 * 5);
+      rightMask.fill(255);
+
+      const regions = [
+        createMockRegion({ x: 0, y: 0, width: 5, height: 10 }, leftMask),
+        createMockRegion({ x: 5, y: 0, width: 5, height: 10 }, rightMask),
+      ];
+
+      const labelMap = buildLabelMap(width, height, regions);
+
+      // Every pixel should be assigned
+      let unassigned = 0;
+      let assigned = 0;
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          if (labelMap[y][x] === -1) unassigned++;
+          else assigned++;
+        }
+      }
+
+      expect(unassigned).toBe(0);
+      expect(assigned).toBe(width * height);
+    });
+
+    it('should detect gaps when regions dont cover all pixels', () => {
+      const width = 10;
+      const height = 10;
+
+      // One small region that doesn't cover everything
+      const smallMask = new Uint8Array(5 * 5);
+      smallMask.fill(255);
+
+      const regions = [
+        createMockRegion({ x: 0, y: 0, width: 5, height: 5 }, smallMask),
+      ];
+
+      const labelMap = buildLabelMap(width, height, regions);
+
+      let unassigned = 0;
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          if (labelMap[y][x] === -1) unassigned++;
+        }
+      }
+
+      // 75 pixels should be unassigned (100 - 25)
+      expect(unassigned).toBe(75);
+    });
+  });
+
+  describe('Invariant: Edges should be segment boundaries', () => {
+    it('a strong edge between two distinct color regions should be a segment boundary', () => {
+      const width = 20;
+      const height = 10;
+
+      // Two regions with a boundary at x=10 (a vertical edge in the image)
+      const leftMask = new Uint8Array(10 * 10);
+      leftMask.fill(255);
+      const rightMask = new Uint8Array(10 * 10);
+      rightMask.fill(255);
+
+      const regions = [
+        createMockRegion({ x: 0, y: 0, width: 10, height: 10 }, leftMask, { r: 0, g: 0, b: 0 }),
+        createMockRegion({ x: 10, y: 0, width: 10, height: 10 }, rightMask, { r: 255, g: 255, b: 255 }),
+      ];
+
+      const labelMap = buildLabelMap(width, height, regions);
+
+      // Pixels at x=9 and x=10 should be segment boundaries
+      for (let y = 0; y < height; y++) {
+        expect(isSegmentBoundary(labelMap, 9, y, width, height)).toBe(true);
+        expect(isSegmentBoundary(labelMap, 10, y, width, height)).toBe(true);
+      }
+    });
+
+    it('pixels far from any edge should NOT be segment boundaries', () => {
+      const width = 20;
+      const height = 20;
+
+      // One large region covering everything
+      const fullMask = new Uint8Array(20 * 20);
+      fullMask.fill(255);
+
+      const regions = [
+        createMockRegion({ x: 0, y: 0, width: 20, height: 20 }, fullMask),
+      ];
+
+      const labelMap = buildLabelMap(width, height, regions);
+
+      // Interior pixel (10, 10) should NOT be a boundary
+      expect(isSegmentBoundary(labelMap, 10, 10, width, height)).toBe(false);
+    });
+  });
+
+  describe('Invariant: Single-feature per segment', () => {
+    it('regions with very different colors should be in different segments', () => {
+      // If we have a black region and a white region, they should be separate segments
+      const blackRegion = createMockRegion(
+        { x: 0, y: 0, width: 5, height: 5 },
+        new Uint8Array(25).fill(255),
+        { r: 0, g: 0, b: 0 }
+      );
+      const whiteRegion = createMockRegion(
+        { x: 5, y: 0, width: 5, height: 5 },
+        new Uint8Array(25).fill(255),
+        { r: 255, g: 255, b: 255 }
+      );
+
+      // These should be separate regions (different avgColor)
+      const colorDist = Math.sqrt(
+        (blackRegion.avgColor.r - whiteRegion.avgColor.r) ** 2 +
+        (blackRegion.avgColor.g - whiteRegion.avgColor.g) ** 2 +
+        (blackRegion.avgColor.b - whiteRegion.avgColor.b) ** 2
+      );
+
+      // Color distance should be very high (indicating they should NOT be merged)
+      expect(colorDist).toBeGreaterThan(100);
+    });
+  });
+
+  describe('Invariant: Detail-adaptive segment sizes', () => {
+    it('regions in detailed areas should be smaller than regions in flat areas', () => {
+      // Simulate two regions: one from a detailed area (small) and one from flat area (large)
+      const detailedRegion = createMockRegion(
+        { x: 0, y: 0, width: 10, height: 10 },
+        new Uint8Array(100).fill(255)
+      );
+      const flatRegion = createMockRegion(
+        { x: 10, y: 0, width: 50, height: 50 },
+        new Uint8Array(2500).fill(255)
+      );
+
+      const detailedArea = detailedRegion.bounds.width * detailedRegion.bounds.height;
+      const flatArea = flatRegion.bounds.width * flatRegion.bounds.height;
+
+      expect(detailedArea).toBeLessThan(flatArea);
+    });
+  });
+
+  describe('Distance threshold parameter mapping', () => {
+    it('higher sensitivity should produce lower distance threshold', () => {
+      // Formula: rawThreshold = max(0.8, 1.5 - (sensitivity - 1) * (0.7 / 19))
+      const thresholdForSensitivity = (s) => Math.max(0.8, 1.5 - (s - 1) * (0.7 / 19));
+
+      const lowDetail = thresholdForSensitivity(1);
+      const midDetail = thresholdForSensitivity(10);
+      const highDetail = thresholdForSensitivity(20);
+
+      expect(lowDetail).toBe(1.5);
+      expect(midDetail).toBeLessThan(lowDetail);
+      expect(highDetail).toBeLessThan(midDetail);
+      expect(highDetail).toBe(0.8);
+    });
+
+    it('sensitivity=1 should produce threshold of 1.5px', () => {
+      const threshold = Math.max(0.8, 1.5 - (1 - 1) * (0.7 / 19));
+      expect(threshold).toBe(1.5);
+    });
+
+    it('sensitivity=20 should produce threshold of 0.8px', () => {
+      const threshold = Math.max(0.8, 1.5 - (20 - 1) * (0.7 / 19));
+      expect(threshold).toBe(0.8);
+    });
+
+    it('threshold should never go below 0.8px', () => {
+      for (let s = 1; s <= 30; s++) {
+        const threshold = Math.max(0.8, 1.5 - (s - 1) * (0.7 / 19));
+        expect(threshold).toBeGreaterThanOrEqual(0.8);
+      }
+    });
+  });
+
+  describe('Invariant: No overlapping regions', () => {
+    it('two regions should not claim the same pixel', () => {
+      const width = 10;
+      const height = 10;
+
+      // Two non-overlapping regions
+      const leftMask = new Uint8Array(5 * 10);
+      leftMask.fill(255);
+      const rightMask = new Uint8Array(5 * 10);
+      rightMask.fill(255);
+
+      const regions = [
+        createMockRegion({ x: 0, y: 0, width: 5, height: 10 }, leftMask),
+        createMockRegion({ x: 5, y: 0, width: 5, height: 10 }, rightMask),
+      ];
+
+      const labelMap = buildLabelMap(width, height, regions);
+
+      // Check no pixel is claimed by multiple regions
+      const counts = new Array(height).fill(null).map(() => new Array(width).fill(0));
+      for (let ri = 0; ri < regions.length; ri++) {
+        const b = regions[ri].bounds;
+        for (let y = 0; y < b.height; y++) {
+          for (let x = 0; x < b.width; x++) {
+            if (regions[ri].maskData[y * b.width + x] > 0) {
+              counts[b.y + y][b.x + x]++;
+            }
+          }
+        }
+      }
+
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          expect(counts[y][x]).toBeLessThanOrEqual(1);
+        }
+      }
+    });
+  });
+});

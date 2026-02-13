@@ -89,7 +89,6 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     }
 
     // Step 1: Edge detection for boundary-aware watershed
-    // Use both Sobel gradient and Canny for robust edge detection
     console.log('[Segmentation] Step 1: Computing edges');
 
     gray = new cv.Mat();
@@ -99,7 +98,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     blurred = new cv.Mat();
     cv.bilateralFilter(gray, blurred, 5, 50, 50);
 
-    // Sobel gradient for broad edge detection
+    // Sobel gradient — smooth, clean edges for the binary edge mask
     const gradX = new cv.Mat();
     const gradY = new cv.Mat();
     gradient = new cv.Mat();
@@ -120,417 +119,490 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     cv.normalize(gradient, gradient, 0, 255, cv.NORM_MINMAX);
     gradient.convertTo(gradient, cv.CV_8U);
 
-    // Canny edge detection for thin/subtle lines (lower thresholds to catch low-contrast edges)
+    // Single Canny pass on bilateral-filtered image for thin edge detection
     const canny = new cv.Mat();
-    cv.Canny(blurred, canny, 30, 90);
+    cv.Canny(blurred, canny, 50, 150);
 
-    // Dilate Canny edges to make them thicker barriers
-    const dilateKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
-    const cannyDilated = new cv.Mat();
-    cv.dilate(canny, cannyDilated, dilateKernel);
-    dilateKernel.delete();
-    canny.delete();
-
-    // Combine: take maximum of Sobel gradient and dilated Canny edges
-    // This creates strong barriers at both broad gradients AND thin lines
+    // Combine Sobel + Canny for the watershed barrier image (used in Step 3)
     const combined = new cv.Mat();
-    cv.max(gradient, cannyDilated, combined);
-    cannyDilated.delete();
+    cv.max(gradient, canny, combined);
+    canny.delete();
 
     console.log('[Segmentation] Edge detection complete');
 
-    // Save edge map for boundary editing (clone before watershed consumes it)
+    // Save edge map for other features
     edgeMap = combined.clone();
 
-    // Step 2: Create markers on a regular grid
-    console.log('[Segmentation] Step 2: Creating grid markers');
-    const maxRegionSize = Math.min(workingImage.cols, workingImage.rows) / regionSize;
-    const baseSpacing = maxRegionSize * 0.7;
+    const imgCols = workingImage.cols;
+    const imgRows = workingImage.rows;
 
-    const spacingMultiplier = 1.3 - (sensitivity / 10) * 1.1;
-    const spacing = Math.max(10, Math.floor(baseSpacing * spacingMultiplier));
+    // Step 1.5: Create binary edge mask
+    // Use gradient + Canny on grayscale AND individual color channels for text detection
+    console.log('[Segmentation] Step 1.5: Creating binary edge mask');
 
-    console.log(`[Segmentation] Grid spacing: ${spacing}px, Max region size: ${maxRegionSize}px`);
+    // Canny on raw grayscale
+    const cannyGray = new cv.Mat();
+    cv.Canny(gray, cannyGray, 15, 60);
 
-    markers = cv.Mat.zeros(workingImage.rows, workingImage.cols, cv.CV_32S);
-    let markerLabel = 1;
+    // Canny on individual color channels to catch colored text/features
+    const channels = new cv.MatVector();
+    cv.split(workingImage, channels);
+    const cannyR = new cv.Mat();
+    const cannyG = new cv.Mat();
+    const cannyB = new cv.Mat();
+    cv.Canny(channels.get(0), cannyR, 20, 70); // Red channel
+    cv.Canny(channels.get(1), cannyG, 20, 70); // Green channel
+    cv.Canny(channels.get(2), cannyB, 20, 70); // Blue channel
+    channels.delete();
 
-    for (let y = Math.floor(spacing / 2); y < workingImage.rows; y += spacing) {
-      for (let x = Math.floor(spacing / 2); x < workingImage.cols; x += spacing) {
-        markers.intPtr(Math.floor(y), Math.floor(x))[0] = markerLabel;
-        markerLabel++;
-      }
+    // Combine all edge sources: gradient + grayscale Canny + color Canny
+    const edgeMaskInput = new cv.Mat();
+    cv.max(gradient, cannyGray, edgeMaskInput);
+    cv.max(edgeMaskInput, cannyR, edgeMaskInput);
+    cv.max(edgeMaskInput, cannyG, edgeMaskInput);
+    cv.max(edgeMaskInput, cannyB, edgeMaskInput);
+    cannyGray.delete();
+    cannyR.delete();
+    cannyG.delete();
+    cannyB.delete();
+
+    const edgeMask = new cv.Mat();
+    cv.threshold(edgeMaskInput, edgeMask, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
+    edgeMaskInput.delete();
+
+    let edgeCount = 0;
+    for (let i = 0; i < imgCols * imgRows; i++) {
+      if (edgeMask.data[i] > 0) edgeCount++;
     }
+    let edgePct = edgeCount / (imgCols * imgRows);
+    console.log(`[Segmentation] Edge mask: ${(edgePct * 100).toFixed(1)}% edge pixels`);
 
-    const markerCount = markerLabel - 1;
-    console.log(`[Segmentation] Created ${markerCount} markers`);
+    // Step 2: Distance transform and marker generation
+    console.log('[Segmentation] Step 2: Distance transform for marker placement');
 
-    if (markerCount > 10000) {
+    // Invert edge mask: interior regions (non-edge) become foreground
+    const interior = new cv.Mat();
+    cv.bitwise_not(edgeMask, interior);
+    edgeMask.delete();
+
+    // Distance transform: each pixel gets its distance to nearest edge
+    const dist = new cv.Mat();
+    cv.distanceTransform(interior, dist, cv.DIST_L2, 5);
+    interior.delete();
+
+    // Map sensitivity (1-20) to distance threshold in pixels
+    // Sweet spot: high enough that blobs don't merge across thin edges,
+    // low enough that small features (text characters) get markers
+    // sensitivity=1 → threshold=2.0
+    // sensitivity=5 (default) → threshold=1.5
+    // sensitivity=10 → threshold=1.1
+    // sensitivity=20 → threshold=0.8
+    const rawThreshold = Math.max(0.8, 1.5 - (sensitivity - 1) * (0.7 / 19));
+    console.log(`[Segmentation] Distance threshold: ${rawThreshold.toFixed(2)}px (sensitivity=${sensitivity})`);
+
+    // Threshold distance transform to find region interiors
+    const foreground = new cv.Mat();
+    cv.threshold(dist, foreground, rawThreshold, 255, cv.THRESH_BINARY);
+    foreground.convertTo(foreground, cv.CV_8U);
+    dist.delete();
+
+    // Find contours of each foreground blob — each becomes a marker
+    const fgContours = new cv.MatVector();
+    const fgHierarchy = new cv.Mat();
+    cv.findContours(foreground, fgContours, fgHierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    foreground.delete();
+    fgHierarchy.delete();
+
+    // Create marker matrix: place a single point at each blob's centroid
+    // (Not filled contours — filling would create huge single-label regions in flat areas)
+    markers = cv.Mat.zeros(imgRows, imgCols, cv.CV_32S);
+    let markerCount = fgContours.size();
+    console.log(`[Segmentation] Found ${markerCount} marker regions from distance transform`);
+
+    if (markerCount > 100000) {
+      fgContours.delete();
       throw new Error(`Too many markers (${markerCount}). Try reducing detail level.`);
     }
 
-    // Step 3: Apply watershed on the edge/gradient image
-    // Using the gradient creates natural barriers at edges, so watershed
-    // boundaries follow image edges even for low-contrast lines
-    console.log('[Segmentation] Step 3: Applying watershed on edge-enhanced image');
+    if (markerCount === 0) {
+      fgContours.delete();
+      throw new Error('No markers generated. Try increasing detail level or using a different image.');
+    }
+
+    const markerGrid = markers.data32S;
+    for (let i = 0; i < markerCount; i++) {
+      const contour = fgContours.get(i);
+      // Compute centroid of the contour
+      const moments = cv.moments(contour);
+      if (moments.m00 > 0) {
+        const cx = Math.round(moments.m10 / moments.m00);
+        const cy = Math.round(moments.m01 / moments.m00);
+        if (cx >= 0 && cx < imgCols && cy >= 0 && cy < imgRows) {
+          markerGrid[cy * imgCols + cx] = i + 1;
+        }
+      } else if (contour.rows > 0) {
+        // Fallback: use first point of contour
+        const px = contour.data32S[0];
+        const py = contour.data32S[1];
+        if (px >= 0 && px < imgCols && py >= 0 && py < imgRows) {
+          markerGrid[py * imgCols + px] = i + 1;
+        }
+      }
+    }
+    fgContours.delete();
+
+    // Add supplementary grid markers to subdivide large uniform areas
+    let nextLabel = markerCount + 1;
+    const maxGap = Math.max(8, Math.round(Math.min(imgCols, imgRows) / 60)); // ~12px - enforces small segments
+    let supplementary = 0;
+    for (let y = Math.floor(maxGap / 2); y < imgRows; y += maxGap) {
+      for (let x = Math.floor(maxGap / 2); x < imgCols; x += maxGap) {
+        if (markerGrid[y * imgCols + x] === 0) { // Only place where no marker exists at this exact pixel
+          markerGrid[y * imgCols + x] = nextLabel++;
+          supplementary++;
+        }
+      }
+    }
+    markerCount = nextLabel - 1;
+    console.log(`[Segmentation] Added ${supplementary} supplementary grid markers (total: ${markerCount})`);
+
+    if (markerCount > 100000) {
+      throw new Error(`Too many markers (${markerCount}). Try reducing detail level.`);
+    }
+
+    // Step 2.5: Boost edge barriers for watershed
+    const boosted = new cv.Mat();
+    combined.convertTo(boosted, cv.CV_8U, 2.0, 0);
+    combined.delete();
+
+    // Step 3: Apply watershed
+    console.log('[Segmentation] Step 3: Applying watershed');
 
     if (typeof cv.watershed !== 'function') {
       throw new Error('cv.watershed is not available in this OpenCV.js build.');
     }
 
-    // Watershed requires 3-channel 8-bit image
     gradient3C = new cv.Mat();
-    cv.cvtColor(combined, gradient3C, cv.COLOR_GRAY2BGR);
-    combined.delete();
+    cv.cvtColor(boosted, gradient3C, cv.COLOR_GRAY2BGR);
+    boosted.delete();
 
     cv.watershed(gradient3C, markers);
 
     console.log('[Segmentation] Watershed completed');
 
-    // Step 4: Extract regions from watershed result
-    // Watershed labels: -1 = boundary, 0 = background, >0 = region labels
+    // Step 4: Extract regions from watershed result using direct typed array access
     console.log('[Segmentation] Step 4: Extracting regions');
 
-    // MEMORY-EFFICIENT APPROACH: Collect pixel coordinates first, then create masks only for valid regions
-    // This avoids creating 2000+ full-sized masks which would consume ~5-10GB of memory
-    const regionPoints = new Map(); // Map<label, Array<{x, y}>>
-    const minArea = (workingImage.cols * workingImage.rows) * 0.0001; // 0.01% minimum
-    const adjacencySet = new Set(); // Stores "min_max" strings for unique region adjacency pairs
+    const markerResult = markers.data32S;
+    const totalPixels = imgCols * imgRows;
+    const minArea = Math.max(10, totalPixels * 0.00002); // ~15px for 736x1042, keeps text/fine features
 
-    console.log(`[Segmentation] Scanning ${markers.rows * markers.cols} pixels...`);
+    // Use a label map: for each pixel, store which label it belongs to (after boundary assignment)
+    // This avoids storing {x,y} objects and uses flat arrays
+    const pixelLabels = new Int32Array(totalPixels); // Final label for each pixel
+    const boundaryIndices = []; // Flat indices of boundary/background pixels
 
-    try {
-      // First pass: collect pixel coordinates for each region
-      // Also assign boundary pixels (-1) and background (0) to nearest region for complete coverage
-      const chunkSize = 100; // Process 100 rows at a time
-      const boundaryPixels = []; // Store boundary pixels to assign later
-
-      for (let startY = 0; startY < markers.rows; startY += chunkSize) {
-        const endY = Math.min(startY + chunkSize, markers.rows);
-
-        for (let y = startY; y < endY; y++) {
-          for (let x = 0; x < markers.cols; x++) {
-            let label;
-            try {
-              label = markers.intPtr(y, x)[0];
-            } catch (e) {
-              console.error(`[Segmentation] Error accessing marker at (${y}, ${x}):`, e);
-              // OpenCV.js may throw numeric error codes instead of Error objects
-              const errorMsg = typeof e === 'object' && e.message ? e.message : String(e);
-              throw new Error(`Failed to read marker at (${y}, ${x}): ${errorMsg}`);
-            }
-
-            // Validate label value
-            if (label === undefined || label === null || isNaN(label)) {
-              throw new Error(`Invalid marker label at (${y}, ${x}): ${label}`);
-            }
-
-            if (label > 0) {
-              // Valid region (not boundary or background)
-              if (!regionPoints.has(label)) {
-                regionPoints.set(label, []);
-              }
-              regionPoints.get(label).push({ x, y });
-            } else if (label === -1 || label === 0) {
-              // Boundary or background - save to assign to nearest region later
-              boundaryPixels.push({ x, y });
-            }
-          }
-        }
-
-        // Log progress for large images
-        if (markers.rows > 1000 && (startY % 500 === 0)) {
-          console.log(`[Segmentation] Progress: ${Math.floor((startY / markers.rows) * 100)}%`);
-        }
+    // First pass: classify pixels
+    for (let i = 0; i < totalPixels; i++) {
+      const label = markerResult[i];
+      if (label > 0) {
+        pixelLabels[i] = label;
+      } else {
+        pixelLabels[i] = 0; // boundary/background, to be assigned
+        boundaryIndices.push(i);
       }
+    }
 
-      // Second pass: assign boundary/background pixels to nearest region and build adjacency graph
-      console.log(`[Segmentation] Assigning ${boundaryPixels.length} boundary/background pixels to nearest regions...`);
-      for (const pixel of boundaryPixels) {
-        let nearestLabel = null;
-        let minDist = Infinity;
-        const neighborLabels = [];
+    // Build adjacency using numeric encoding
+    const adjacencyPairs = new Set(); // Stores a*65536+b (a < b)
 
-        // Check neighboring pixels (8-connected) to find nearest region
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            if (dx === 0 && dy === 0) continue;
+    // Second pass: assign boundary pixels to nearest region and build adjacency
+    console.log(`[Segmentation] Assigning ${boundaryIndices.length} boundary pixels...`);
+    for (const idx of boundaryIndices) {
+      const px = idx % imgCols;
+      const py = (idx - px) / imgCols;
+      let nearestLabel = 0;
+      let minDist = Infinity;
+      let label1 = 0, label2 = 0; // Track up to 2 distinct neighbor labels for adjacency
 
-            const nx = pixel.x + dx;
-            const ny = pixel.y + dy;
-
-            if (nx >= 0 && nx < markers.cols && ny >= 0 && ny < markers.rows) {
-              const neighborLabel = markers.intPtr(ny, nx)[0];
-              if (neighborLabel > 0) {
-                neighborLabels.push(neighborLabel);
-                // Found a neighbor with a valid region
-                const dist = Math.abs(dx) + Math.abs(dy); // Manhattan distance
-                if (dist < minDist) {
-                  minDist = dist;
-                  nearestLabel = neighborLabel;
-                }
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const nx = px + dx;
+          const ny = py + dy;
+          if (nx >= 0 && nx < imgCols && ny >= 0 && ny < imgRows) {
+            const neighborLabel = markerResult[ny * imgCols + nx];
+            if (neighborLabel > 0) {
+              const dist = Math.abs(dx) + Math.abs(dy);
+              if (dist < minDist) {
+                minDist = dist;
+                nearestLabel = neighborLabel;
+              }
+              // Track adjacency
+              if (label1 === 0) label1 = neighborLabel;
+              else if (neighborLabel !== label1 && label2 === 0) label2 = neighborLabel;
+              else if (neighborLabel !== label1 && neighborLabel !== label2) {
+                // More than 2 labels: add pairs for all combinations
+                const a = Math.min(label1, neighborLabel);
+                const b = Math.max(label1, neighborLabel);
+                adjacencyPairs.add(a * 65536 + b);
+                const a2 = Math.min(label2, neighborLabel);
+                const b2 = Math.max(label2, neighborLabel);
+                adjacencyPairs.add(a2 * 65536 + b2);
               }
             }
           }
         }
-
-        // Record adjacency: all distinct region labels around this boundary pixel are adjacent
-        const uniqueNeighborLabels = [...new Set(neighborLabels)];
-        for (let i = 0; i < uniqueNeighborLabels.length; i++) {
-          for (let j = i + 1; j < uniqueNeighborLabels.length; j++) {
-            const a = Math.min(uniqueNeighborLabels[i], uniqueNeighborLabels[j]);
-            const b = Math.max(uniqueNeighborLabels[i], uniqueNeighborLabels[j]);
-            adjacencySet.add(`${a}_${b}`);
-          }
-        }
-
-        // Assign to nearest region (or first available region if no neighbors)
-        if (nearestLabel !== null) {
-          if (!regionPoints.has(nearestLabel)) {
-            regionPoints.set(nearestLabel, []);
-          }
-          regionPoints.get(nearestLabel).push({ x: pixel.x, y: pixel.y });
-        } else if (regionPoints.size > 0) {
-          // No neighbors found, assign to first region as fallback
-          const firstLabel = regionPoints.keys().next().value;
-          regionPoints.get(firstLabel).push({ x: pixel.x, y: pixel.y });
-        }
       }
-    } catch (e) {
-      console.error('[Segmentation] Error during region extraction:', e);
-      // Ensure we throw a proper Error object, not a numeric code
-      if (e instanceof Error) {
-        throw e;
-      } else {
-        throw new Error(`Region extraction failed with code: ${e}`);
+
+      if (label1 > 0 && label2 > 0) {
+        const a = Math.min(label1, label2);
+        const b = Math.max(label1, label2);
+        adjacencyPairs.add(a * 65536 + b);
+      }
+
+      pixelLabels[idx] = nearestLabel > 0 ? nearestLabel : 1; // fallback to label 1
+    }
+
+    // Count pixels per label
+    const labelCounts = new Map();
+    for (let i = 0; i < totalPixels; i++) {
+      const l = pixelLabels[i];
+      if (l > 0) {
+        labelCounts.set(l, (labelCounts.get(l) || 0) + 1);
       }
     }
 
-    console.log(`[Segmentation] Found ${regionPoints.size} regions from watershed`);
+    console.log(`[Segmentation] Found ${labelCounts.size} regions from watershed`);
 
-    // Step 3.5: Redistribute pixels from small regions to ensure complete coverage
-    console.log('[Segmentation] Step 3.5: Redistributing pixels from small regions to ensure 100% coverage');
-
-    // Identify small regions that will be filtered out
-    const smallRegions = [];
-    const largeRegions = [];
-
-    for (const [label, points] of regionPoints.entries()) {
-      if (points.length < minArea) {
-        smallRegions.push({ label, points });
-      } else {
-        largeRegions.push({ label, points });
-      }
+    // Step 3.5: Redistribute small regions using label map (fast: no expanding search)
+    console.log('[Segmentation] Step 3.5: Redistributing small regions');
+    const largeLabels = new Set();
+    const smallLabels = new Set();
+    for (const [label, count] of labelCounts) {
+      if (count >= minArea) largeLabels.add(label);
+      else smallLabels.add(label);
     }
 
-    console.log(`[Segmentation] Found ${smallRegions.length} small regions to redistribute (${largeRegions.length} large regions)`);
+    console.log(`[Segmentation] ${smallLabels.size} small regions to redistribute`);
 
-    // Redistribute pixels from small regions to nearest large region
-    for (const smallRegion of smallRegions) {
-      for (const pixel of smallRegion.points) {
-        // Find nearest large region by checking neighbors
-        let nearestLabel = null;
-        let searchRadius = 1;
-        const maxSearchRadius = 50; // Maximum search distance
+    if (smallLabels.size > 0) {
+      // For each small region pixel, find the nearest large-region pixel via BFS-like scan
+      // Simple approach: scan neighbors of each small pixel and reassign to adjacent large region
+      let reassigned = 0;
+      for (let pass = 0; pass < 5 && smallLabels.size > 0; pass++) {
+        for (let i = 0; i < totalPixels; i++) {
+          const l = pixelLabels[i];
+          if (!smallLabels.has(l)) continue;
 
-        // Expand search radius until we find a large region
-        while (nearestLabel === null && searchRadius <= maxSearchRadius) {
-          for (let dy = -searchRadius; dy <= searchRadius; dy++) {
-            for (let dx = -searchRadius; dx <= searchRadius; dx++) {
+          const px = i % imgCols;
+          const py = (i - px) / imgCols;
+
+          // Check 8-connected neighbors for a large region
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
               if (dx === 0 && dy === 0) continue;
-
-              const nx = pixel.x + dx;
-              const ny = pixel.y + dy;
-
-              if (nx >= 0 && nx < markers.cols && ny >= 0 && ny < markers.rows) {
-                const neighborLabel = markers.intPtr(ny, nx)[0];
-
-                // Check if this neighbor belongs to a large region
-                if (neighborLabel > 0) {
-                  const neighborRegion = regionPoints.get(neighborLabel);
-                  if (neighborRegion && neighborRegion.length >= minArea) {
-                    nearestLabel = neighborLabel;
-                    break;
-                  }
+              const nx = px + dx;
+              const ny = py + dy;
+              if (nx >= 0 && nx < imgCols && ny >= 0 && ny < imgRows) {
+                const nl = pixelLabels[ny * imgCols + nx];
+                if (largeLabels.has(nl)) {
+                  pixelLabels[i] = nl;
+                  labelCounts.set(nl, (labelCounts.get(nl) || 0) + 1);
+                  const oldCount = labelCounts.get(l) - 1;
+                  labelCounts.set(l, oldCount);
+                  reassigned++;
+                  dy = 2; // break outer
+                  break;
                 }
               }
             }
-            if (nearestLabel !== null) break;
           }
-          searchRadius++;
         }
-
-        // Add pixel to nearest large region
-        if (nearestLabel !== null) {
-          regionPoints.get(nearestLabel).push({ x: pixel.x, y: pixel.y });
-        } else if (largeRegions.length > 0) {
-          // Fallback: add to first large region if no neighbor found
-          const firstLargeLabel = largeRegions[0].label;
-          regionPoints.get(firstLargeLabel).push({ x: pixel.x, y: pixel.y });
+        // After each pass, check if any small labels became empty
+        for (const sl of [...smallLabels]) {
+          if ((labelCounts.get(sl) || 0) <= 0) {
+            smallLabels.delete(sl);
+            labelCounts.delete(sl);
+          }
         }
       }
-
-      // Remove the small region from the map
-      regionPoints.delete(smallRegion.label);
+      // Any remaining small region pixels: assign to nearest large region (fallback)
+      if (smallLabels.size > 0) {
+        const fallbackLabel = largeLabels.values().next().value || 1;
+        for (let i = 0; i < totalPixels; i++) {
+          if (smallLabels.has(pixelLabels[i])) {
+            pixelLabels[i] = fallbackLabel;
+          }
+        }
+        for (const sl of smallLabels) labelCounts.delete(sl);
+      }
+      console.log(`[Segmentation] Reassigned ${reassigned} pixels from small regions`);
     }
 
-    console.log(`[Segmentation] After redistribution: ${regionPoints.size} regions remaining`);
-
-    // Step 4: Compute average color for each region (for merging and Select Similar)
-    console.log('[Segmentation] Step 4: Computing average colors for region merging');
+    // Step 4b: Compute average color for each region
+    console.log('[Segmentation] Computing average colors');
     const regionColors = new Map();
+    const colorAccum = new Map(); // label -> {r, g, b, count}
+    const imgData = workingImage.data;
 
-    for (const [label, points] of regionPoints.entries()) {
-      let totalR = 0, totalG = 0, totalB = 0;
-      const sampleStep = Math.max(1, Math.floor(points.length / 200));
-      let sampleCount = 0;
-      for (let i = 0; i < points.length; i += sampleStep) {
-        const pt = points[i];
-        const pixelIdx = (pt.y * workingImage.cols + pt.x) * 4;
-        totalR += workingImage.data[pixelIdx];
-        totalG += workingImage.data[pixelIdx + 1];
-        totalB += workingImage.data[pixelIdx + 2];
-        sampleCount++;
+    for (let i = 0; i < totalPixels; i++) {
+      const l = pixelLabels[i];
+      if (l <= 0 || !labelCounts.has(l)) continue;
+      let acc = colorAccum.get(l);
+      if (!acc) {
+        acc = { r: 0, g: 0, b: 0, count: 0 };
+        colorAccum.set(l, acc);
       }
-      if (sampleCount > 0) {
-        regionColors.set(label, {
-          r: totalR / sampleCount,
-          g: totalG / sampleCount,
-          b: totalB / sampleCount
-        });
+      // Sample at most ~200 pixels per region
+      if (acc.count < 200 || Math.random() < 200 / labelCounts.get(l)) {
+        const pi = i * 4;
+        acc.r += imgData[pi];
+        acc.g += imgData[pi + 1];
+        acc.b += imgData[pi + 2];
+        acc.count++;
+      }
+    }
+    for (const [label, acc] of colorAccum) {
+      if (acc.count > 0) {
+        regionColors.set(label, { r: acc.r / acc.count, g: acc.g / acc.count, b: acc.b / acc.count });
       }
     }
 
     // Step 5: Merge adjacent regions with similar colors
     console.log(`[Segmentation] Step 5: Merging similar regions (threshold: ${mergeThreshold})`);
 
-    if (mergeThreshold > 0 && adjacencySet.size > 0) {
-      const labels = Array.from(regionPoints.keys());
-      const labelToIndex = new Map();
-      labels.forEach((label, idx) => labelToIndex.set(label, idx));
+    // Convert adjacencyPairs to a label-based adjacency map
+    const adjacencyMap = new Map();
+    for (const pair of adjacencyPairs) {
+      const a = Math.floor(pair / 65536);
+      const b = pair % 65536;
+      if (!labelCounts.has(a) || !labelCounts.has(b)) continue;
+      if (!adjacencyMap.has(a)) adjacencyMap.set(a, []);
+      if (!adjacencyMap.has(b)) adjacencyMap.set(b, []);
+      adjacencyMap.get(a).push(b);
+      adjacencyMap.get(b).push(a);
+    }
 
-      const uf = new UnionFind(labels.length);
-      // Track pixel count and bounding box per union-find group to prevent oversized merges
-      const groupSize = labels.map(label => regionPoints.get(label).length);
-      const maxMergedArea = workingImage.cols * workingImage.rows * 0.03; // 3% of image max
-      const maxMergedWidth = Math.floor(workingImage.cols / 40);
-      const maxMergedHeight = Math.floor(workingImage.rows / 40);
+    // Merge using union-find
+    const mergeLabels = Array.from(labelCounts.keys());
+    const labelToMergeIdx = new Map();
+    mergeLabels.forEach((l, i) => labelToMergeIdx.set(l, i));
 
-      // Track bounding boxes per group
-      const groupBounds = labels.map(label => {
-        const points = regionPoints.get(label);
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        // Sample points for speed
-        const step = Math.max(1, Math.floor(points.length / 100));
-        for (let i = 0; i < points.length; i += step) {
-          const pt = points[i];
-          if (pt.x < minX) minX = pt.x;
-          if (pt.x > maxX) maxX = pt.x;
-          if (pt.y < minY) minY = pt.y;
-          if (pt.y > maxY) maxY = pt.y;
+    if (mergeThreshold > 0) {
+      const uf = new UnionFind(mergeLabels.length);
+      const groupSize = mergeLabels.map(l => labelCounts.get(l));
+      const maxMergedArea = totalPixels * 0.005; // 0.5% of image (was 3%)
+      const maxMergedWidth = Math.floor(imgCols / 80); // ~9px for 736px wide (was /40)
+      const maxMergedHeight = Math.floor(imgRows / 80); // ~13px for 1042px tall (was /40)
+
+      // Compute bounding boxes per label by scanning pixelLabels once
+      const labelBounds = new Map();
+      for (let i = 0; i < totalPixels; i++) {
+        const l = pixelLabels[i];
+        if (!labelCounts.has(l)) continue;
+        const px = i % imgCols;
+        const py = (i - px) / imgCols;
+        let b = labelBounds.get(l);
+        if (!b) {
+          b = { minX: px, minY: py, maxX: px, maxY: py };
+          labelBounds.set(l, b);
+        } else {
+          if (px < b.minX) b.minX = px;
+          if (px > b.maxX) b.maxX = px;
+          if (py < b.minY) b.minY = py;
+          if (py > b.maxY) b.maxY = py;
         }
-        return { minX, minY, maxX, maxY };
+      }
+
+      const groupBounds = mergeLabels.map(l => {
+        const b = labelBounds.get(l);
+        return b || { minX: 0, minY: 0, maxX: 0, maxY: 0 };
       });
 
-      for (const pairKey of adjacencySet) {
-        const sepIdx = pairKey.indexOf('_');
-        const a = parseInt(pairKey.substring(0, sepIdx));
-        const b = parseInt(pairKey.substring(sepIdx + 1));
-
-        if (!regionPoints.has(a) || !regionPoints.has(b)) continue;
+      for (const pair of adjacencyPairs) {
+        const a = Math.floor(pair / 65536);
+        const b = pair % 65536;
+        const idxA = labelToMergeIdx.get(a);
+        const idxB = labelToMergeIdx.get(b);
+        if (idxA === undefined || idxB === undefined) continue;
 
         const colorA = regionColors.get(a);
         const colorB = regionColors.get(b);
         if (!colorA || !colorB) continue;
 
-        const dist = Math.sqrt(
-          (colorA.r - colorB.r) ** 2 +
-          (colorA.g - colorB.g) ** 2 +
-          (colorA.b - colorB.b) ** 2
-        );
-
+        const dist = Math.sqrt((colorA.r - colorB.r) ** 2 + (colorA.g - colorB.g) ** 2 + (colorA.b - colorB.b) ** 2);
         if (dist < mergeThreshold) {
-          const idxA = labelToIndex.get(a);
-          const idxB = labelToIndex.get(b);
-          if (idxA !== undefined && idxB !== undefined) {
-            const rootA = uf.find(idxA);
-            const rootB = uf.find(idxB);
-            if (rootA !== rootB) {
-              // Don't merge if combined size would be too large
-              if (groupSize[rootA] + groupSize[rootB] > maxMergedArea) continue;
-              // Don't merge if combined bounding box would be too wide or tall
-              const combinedBounds = {
-                minX: Math.min(groupBounds[rootA].minX, groupBounds[rootB].minX),
-                minY: Math.min(groupBounds[rootA].minY, groupBounds[rootB].minY),
-                maxX: Math.max(groupBounds[rootA].maxX, groupBounds[rootB].maxX),
-                maxY: Math.max(groupBounds[rootA].maxY, groupBounds[rootB].maxY),
-              };
-              if (combinedBounds.maxX - combinedBounds.minX > maxMergedWidth) continue;
-              if (combinedBounds.maxY - combinedBounds.minY > maxMergedHeight) continue;
-              uf.union(idxA, idxB);
-              // Update group size and bounds on the new root
-              const newRoot = uf.find(idxA);
-              groupSize[newRoot] = groupSize[rootA] + groupSize[rootB];
-              groupBounds[newRoot] = combinedBounds;
-            }
+          const rootA = uf.find(idxA);
+          const rootB = uf.find(idxB);
+          if (rootA !== rootB) {
+            if (groupSize[rootA] + groupSize[rootB] > maxMergedArea) continue;
+            const cb = {
+              minX: Math.min(groupBounds[rootA].minX, groupBounds[rootB].minX),
+              minY: Math.min(groupBounds[rootA].minY, groupBounds[rootB].minY),
+              maxX: Math.max(groupBounds[rootA].maxX, groupBounds[rootB].maxX),
+              maxY: Math.max(groupBounds[rootA].maxY, groupBounds[rootB].maxY),
+            };
+            if (cb.maxX - cb.minX > maxMergedWidth) continue;
+            if (cb.maxY - cb.minY > maxMergedHeight) continue;
+            uf.union(idxA, idxB);
+            const newRoot = uf.find(idxA);
+            groupSize[newRoot] = groupSize[rootA] + groupSize[rootB];
+            groupBounds[newRoot] = cb;
           }
         }
       }
 
-      // Group regions by their union-find root
-      const rootToLabels = new Map();
-      for (let i = 0; i < labels.length; i++) {
-        const root = uf.find(i);
-        if (!rootToLabels.has(root)) {
-          rootToLabels.set(root, []);
-        }
-        rootToLabels.get(root).push(labels[i]);
+      // Remap pixelLabels to use root labels
+      const indexToRoot = mergeLabels.map((l, i) => mergeLabels[uf.find(i)]);
+      const labelRemap = new Map();
+      mergeLabels.forEach((l, i) => labelRemap.set(l, indexToRoot[i]));
+
+      const preMergeCount = labelCounts.size;
+      for (let i = 0; i < totalPixels; i++) {
+        const remapped = labelRemap.get(pixelLabels[i]);
+        if (remapped !== undefined) pixelLabels[i] = remapped;
       }
 
-      // Merge pixel arrays and recompute average colors
-      const mergedRegionPoints = new Map();
-      for (const [root, memberLabels] of rootToLabels.entries()) {
-        const primaryLabel = memberLabels[0];
-        const allPoints = [];
-        let totalR = 0, totalG = 0, totalB = 0, totalWeight = 0;
-        for (const label of memberLabels) {
-          const pts = regionPoints.get(label);
-          allPoints.push(...pts);
-          const color = regionColors.get(label);
-          if (color) {
-            totalR += color.r * pts.length;
-            totalG += color.g * pts.length;
-            totalB += color.b * pts.length;
-            totalWeight += pts.length;
-          }
+      // Recompute label counts and colors after merge
+      labelCounts.clear();
+      for (let i = 0; i < totalPixels; i++) {
+        const l = pixelLabels[i];
+        labelCounts.set(l, (labelCounts.get(l) || 0) + 1);
+      }
+
+      // Recompute average colors for merged regions
+      colorAccum.clear();
+      for (let i = 0; i < totalPixels; i++) {
+        const l = pixelLabels[i];
+        if (!labelCounts.has(l)) continue;
+        let acc = colorAccum.get(l);
+        if (!acc) { acc = { r: 0, g: 0, b: 0, count: 0 }; colorAccum.set(l, acc); }
+        if (acc.count < 200) {
+          const pi = i * 4;
+          acc.r += imgData[pi]; acc.g += imgData[pi + 1]; acc.b += imgData[pi + 2];
+          acc.count++;
         }
-        mergedRegionPoints.set(primaryLabel, allPoints);
-        if (totalWeight > 0) {
-          regionColors.set(primaryLabel, {
-            r: totalR / totalWeight,
-            g: totalG / totalWeight,
-            b: totalB / totalWeight
-          });
+      }
+      regionColors.clear();
+      for (const [label, acc] of colorAccum) {
+        if (acc.count > 0) {
+          regionColors.set(label, { r: acc.r / acc.count, g: acc.g / acc.count, b: acc.b / acc.count });
         }
       }
 
-      const premergeCount = regionPoints.size;
-      regionPoints.clear();
-      for (const [label, points] of mergedRegionPoints.entries()) {
-        regionPoints.set(label, points);
-      }
-
-      console.log(`[Segmentation] Merged ${premergeCount} regions down to ${regionPoints.size}`);
+      console.log(`[Segmentation] Merged ${preMergeCount} regions down to ${labelCounts.size}`);
     }
 
-    // Build post-merge adjacency map for Select Similar feature
+    // Rebuild adjacency after merge
     const mergedAdjacency = new Map();
-    const survivingLabels = new Set(regionPoints.keys());
-    for (const pairKey of adjacencySet) {
-      const sepIdx = pairKey.indexOf('_');
-      const a = parseInt(pairKey.substring(0, sepIdx));
-      const b = parseInt(pairKey.substring(sepIdx + 1));
-      if (survivingLabels.has(a) && survivingLabels.has(b) && a !== b) {
+    for (const pair of adjacencyPairs) {
+      const a = Math.floor(pair / 65536);
+      const b = pair % 65536;
+      // Map to post-merge labels
+      const remappedA = pixelLabels.length > 0 ? a : a; // already remapped in pixelLabels
+      const remappedB = pixelLabels.length > 0 ? b : b;
+      if (labelCounts.has(a) && labelCounts.has(b) && a !== b) {
         if (!mergedAdjacency.has(a)) mergedAdjacency.set(a, new Set());
         if (!mergedAdjacency.has(b)) mergedAdjacency.set(b, new Set());
         mergedAdjacency.get(a).add(b);
@@ -538,116 +610,85 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
       }
     }
 
-    // Step 6: Create masks and contours only for regions that meet minimum area
-    console.log('[Segmentation] Step 6: Creating masks and contours for valid regions');
+    // Step 6: Create masks and contours using direct typed array access
+    console.log('[Segmentation] Step 6: Creating masks and contours');
 
     let processedCount = 0;
-    for (const [label, points] of regionPoints.entries()) {
-      try {
-        // At this point, all regions should be large enough (small ones were redistributed)
-        if (points.length < minArea) {
-          console.warn(`[Segmentation] WARNING: Found small region after redistribution (${points.length} < ${minArea})`);
-          processedCount++;
-          continue;
-        }
+    const finalLabels = Array.from(labelCounts.keys()).filter(l => labelCounts.get(l) >= minArea);
 
-        // Calculate bounding box from points
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const pt of points) {
-          if (pt.x < minX) minX = pt.x;
-          if (pt.x > maxX) maxX = pt.x;
-          if (pt.y < minY) minY = pt.y;
-          if (pt.y > maxY) maxY = pt.y;
-        }
+    for (const label of finalLabels) {
+      // Compute bounding box by scanning pixelLabels
+      let minX = imgCols, minY = imgRows, maxX = 0, maxY = 0;
+      for (let i = 0; i < totalPixels; i++) {
+        if (pixelLabels[i] !== label) continue;
+        const px = i % imgCols;
+        const py = (i - px) / imgCols;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+      }
 
-        const bounds = {
-          x: minX,
-          y: minY,
-          width: maxX - minX + 1,
-          height: maxY - minY + 1
-        };
+      const bw = maxX - minX + 1;
+      const bh = maxY - minY + 1;
+      if (bw <= 0 || bh <= 0) continue;
 
-        // Validate bounds
-        if (bounds.width <= 0 || bounds.height <= 0) {
-          console.warn(`[Segmentation] Skipping invalid bounds for region ${label}`);
-          processedCount++;
-          continue;
-        }
+      const bounds = { x: minX, y: minY, width: bw, height: bh };
 
-        // Create a CROPPED mask (only as large as the bounding box)
-        const mask = cv.Mat.zeros(bounds.height, bounds.width, cv.CV_8U);
+      // Create cropped mask using direct data access
+      const mask = cv.Mat.zeros(bh, bw, cv.CV_8U);
+      const maskData = mask.data;
+      for (let i = 0; i < totalPixels; i++) {
+        if (pixelLabels[i] !== label) continue;
+        const px = i % imgCols;
+        const py = (i - px) / imgCols;
+        maskData[(py - minY) * bw + (px - minX)] = 255;
+      }
 
-        // Fill the mask with points (translated to local coordinates)
-        for (const pt of points) {
-          const localX = pt.x - minX;
-          const localY = pt.y - minY;
-          if (localX >= 0 && localX < bounds.width && localY >= 0 && localY < bounds.height) {
-            mask.ucharPtr(localY, localX)[0] = 255;
-          }
-        }
+      // Find contours
+      const contours = new cv.MatVector();
+      const hierarchy = new cv.Mat();
+      cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-        // Find contours from this mask
-        const contours = new cv.MatVector();
-        const hierarchy = new cv.Mat();
-        cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-
-        if (contours.size() > 0) {
-          const contour = contours.get(0);
-
-          // Validate contour
-          if (!contour || contour.rows === 0) {
-            console.warn(`[Segmentation] Skipping empty contour for region ${label}`);
-            hierarchy.delete();
-            contours.delete();
-            mask.delete();
-            processedCount++;
-            continue;
-          }
-
+      if (contours.size() > 0) {
+        const contour = contours.get(0);
+        if (contour && contour.rows > 0) {
           const area = cv.contourArea(contour);
-
-          // Since we already redistributed small regions, we should keep this one
-          // Only skip if contour extraction genuinely failed
           if (area > 0) {
-            // Translate contour coordinates back to image space
+            // Translate contour to image space
             const translatedContour = new cv.Mat(contour.rows, 1, cv.CV_32SC2);
             for (let i = 0; i < contour.rows; i++) {
               translatedContour.data32S[i * 2] = contour.data32S[i * 2] + minX;
               translatedContour.data32S[i * 2 + 1] = contour.data32S[i * 2 + 1] + minY;
             }
 
-            // Store region with CROPPED mask (memory efficient)
-            // NOTE: We store translatedContour directly (don't delete it, it's owned by the region now)
             regions.push({
-              contour: translatedContour, // We OWN this now, don't delete
-              mask: mask.clone(),
-              bounds: bounds, // In downscaled space
-              scaleFactor: scaleFactor, // Store for later scaling
+              contour: translatedContour,
+              mask: mask, // Transfer ownership (no clone needed)
+              bounds: bounds,
+              scaleFactor: scaleFactor,
               selected: false,
               label: label,
               avgColor: regionColors.get(label) || { r: 128, g: 128, b: 128 },
-              adjacentIndices: [] // Will be populated after all regions are created
+              adjacentIndices: []
             });
 
-            // Don't delete translatedContour - it's now owned by the region!
-          } else {
-            console.warn(`[Segmentation] Skipping region ${label} with zero contour area`);
+            hierarchy.delete();
+            contours.delete();
+            processedCount++;
+            if (processedCount % 200 === 0) {
+              console.log(`[Segmentation] Processed ${processedCount}/${finalLabels.length} regions`);
+            }
+            continue; // Skip the cleanup below since mask is transferred
           }
         }
-
-        // Clean up
-        hierarchy.delete();
-        contours.delete();
-        mask.delete();
-
-        processedCount++;
-        if (processedCount % 100 === 0) {
-          console.log(`[Segmentation] Processed ${processedCount}/${regionPoints.size} regions`);
-        }
-      } catch (e) {
-        console.error(`[Segmentation] Error processing region ${label}:`, e);
-        throw new Error(`Failed to process region ${label}: ${e.message || e}`);
       }
+
+      // Cleanup if region wasn't added
+      hierarchy.delete();
+      contours.delete();
+      mask.delete();
+      processedCount++;
     }
 
     console.log(`[Segmentation] Returning ${regions.length} valid regions`);
@@ -1127,4 +1168,192 @@ export function rebuildRegionMask(region, cv) {
 
   region.bounds = newBounds;
   region.mask = newMask;
+}
+
+/**
+ * Split selected regions into finer sub-segments by re-running segmentation
+ * on the cropped area containing those regions.
+ *
+ * @param {cv.Mat} originalImage - The full original image
+ * @param {Array} regions - All current regions
+ * @param {Array<number>} selectedIndices - Indices of regions to split
+ * @param {Object} cv - OpenCV instance
+ * @param {number} sensitivity - Sensitivity for sub-segmentation
+ * @param {number} regionSize - Region size for sub-segmentation
+ * @param {number} mergeThreshold - Merge threshold for sub-segmentation
+ * @returns {Array} Updated regions array with selected regions replaced by finer sub-regions
+ */
+export function splitRegions(originalImage, regions, selectedIndices, cv, sensitivity, regionSize, mergeThreshold) {
+  if (!selectedIndices || selectedIndices.length === 0) return regions;
+
+  const selectedRegions = selectedIndices.map(i => regions[i]);
+  const existingScaleFactor = selectedRegions[0].scaleFactor || 1;
+
+  // Step 1: Compute combined bounding box in original image coords
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const scale = 1 / existingScaleFactor;
+  for (const region of selectedRegions) {
+    const b = region.bounds;
+    minX = Math.min(minX, Math.round(b.x * scale));
+    minY = Math.min(minY, Math.round(b.y * scale));
+    maxX = Math.max(maxX, Math.round((b.x + b.width) * scale));
+    maxY = Math.max(maxY, Math.round((b.y + b.height) * scale));
+  }
+
+  // Add small padding and clamp to image bounds
+  const pad = 5;
+  minX = Math.max(0, minX - pad);
+  minY = Math.max(0, minY - pad);
+  maxX = Math.min(originalImage.cols, maxX + pad);
+  maxY = Math.min(originalImage.rows, maxY + pad);
+
+  const cropWidth = maxX - minX;
+  const cropHeight = maxY - minY;
+  if (cropWidth <= 0 || cropHeight <= 0) return regions;
+
+  console.log(`[Split] Cropping to (${minX},${minY}) ${cropWidth}x${cropHeight} from ${originalImage.cols}x${originalImage.rows}`);
+
+  // Step 2: Crop the original image
+  const cropRect = new cv.Rect(minX, minY, cropWidth, cropHeight);
+  const croppedImage = originalImage.roi(cropRect).clone();
+
+  // Step 3: Create a combined mask of selected regions in the crop's coordinate space
+  // We'll use this to filter out new regions that fall outside the original selection
+  const combinedMask = cv.Mat.zeros(cropHeight, cropWidth, cv.CV_8UC1);
+  for (const region of selectedRegions) {
+    const scaledContour = new cv.Mat(region.contour.rows, 1, cv.CV_32SC2);
+    for (let i = 0; i < region.contour.rows; i++) {
+      scaledContour.data32S[i * 2] = Math.round(region.contour.data32S[i * 2] * scale) - minX;
+      scaledContour.data32S[i * 2 + 1] = Math.round(region.contour.data32S[i * 2 + 1] * scale) - minY;
+    }
+    const contourVec = new cv.MatVector();
+    contourVec.push_back(scaledContour);
+    cv.drawContours(combinedMask, contourVec, 0, new cv.Scalar(255), -1);
+    contourVec.delete();
+    scaledContour.delete();
+  }
+
+  // Step 4: Run segmentation on the crop
+  let subResult;
+  try {
+    subResult = segmentImage(croppedImage, sensitivity, regionSize, cv, mergeThreshold);
+  } catch (error) {
+    console.error('[Split] Sub-segmentation failed:', error);
+    croppedImage.delete();
+    combinedMask.delete();
+    return regions;
+  }
+
+  const subRegions = subResult.regions;
+  const subScaleFactor = subRegions.length > 0 ? (subRegions[0].scaleFactor || 1) : 1;
+  // subScaleFactor is relative to the crop. The overall scaleFactor from original is:
+  // overallScaleFactor = subScaleFactor (crop was at full res, segmentImage may have downscaled it)
+
+  console.log(`[Split] Got ${subRegions.length} sub-regions (subScaleFactor=${subScaleFactor.toFixed(3)})`);
+
+  // Step 5: Filter and remap new regions
+  const newSubRegions = [];
+  const subScale = 1 / subScaleFactor; // to go from sub-downscaled to crop coords
+  const cropToOrigScale = existingScaleFactor; // original -> working scale
+
+  for (const subRegion of subRegions) {
+    // Check overlap with combined mask: sample contour points
+    let insideCount = 0;
+    let totalCount = 0;
+    for (let i = 0; i < subRegion.contour.rows; i++) {
+      const cx = Math.round(subRegion.contour.data32S[i * 2] * subScale);
+      const cy = Math.round(subRegion.contour.data32S[i * 2 + 1] * subScale);
+      if (cx >= 0 && cx < cropWidth && cy >= 0 && cy < cropHeight) {
+        totalCount++;
+        if (combinedMask.ucharAt(cy, cx) > 0) {
+          insideCount++;
+        }
+      }
+    }
+
+    // Discard regions mostly outside the original selection
+    if (totalCount === 0 || insideCount / totalCount < 0.5) {
+      cleanupMats(subRegion.contour, subRegion.mask);
+      continue;
+    }
+
+    // Remap contour coordinates from sub-downscaled-crop space to global working space
+    // sub-downscaled-crop -> crop (original res) -> original -> working
+    // x_working = (x_sub / subScaleFactor + minX) * existingScaleFactor
+    const remappedContour = new cv.Mat(subRegion.contour.rows, 1, cv.CV_32SC2);
+    for (let i = 0; i < subRegion.contour.rows; i++) {
+      const cropX = subRegion.contour.data32S[i * 2] * subScale + minX;
+      const cropY = subRegion.contour.data32S[i * 2 + 1] * subScale + minY;
+      remappedContour.data32S[i * 2] = Math.round(cropX * cropToOrigScale);
+      remappedContour.data32S[i * 2 + 1] = Math.round(cropY * cropToOrigScale);
+    }
+
+    // Remap bounds
+    const remappedBounds = {
+      x: Math.round((subRegion.bounds.x * subScale + minX) * cropToOrigScale),
+      y: Math.round((subRegion.bounds.y * subScale + minY) * cropToOrigScale),
+      width: Math.round(subRegion.bounds.width * subScale * cropToOrigScale),
+      height: Math.round(subRegion.bounds.height * subScale * cropToOrigScale)
+    };
+
+    // Rebuild the mask for the remapped contour
+    const newMask = cv.Mat.zeros(remappedBounds.height, remappedBounds.width, cv.CV_8UC1);
+    const localContour = new cv.Mat(remappedContour.rows, 1, cv.CV_32SC2);
+    for (let i = 0; i < remappedContour.rows; i++) {
+      localContour.data32S[i * 2] = remappedContour.data32S[i * 2] - remappedBounds.x;
+      localContour.data32S[i * 2 + 1] = remappedContour.data32S[i * 2 + 1] - remappedBounds.y;
+    }
+    const contourVec = new cv.MatVector();
+    contourVec.push_back(localContour);
+    cv.drawContours(newMask, contourVec, 0, new cv.Scalar(255), -1);
+    contourVec.delete();
+    localContour.delete();
+
+    // Clean up old sub-region mask and contour
+    cleanupMats(subRegion.contour, subRegion.mask);
+
+    newSubRegions.push({
+      contour: remappedContour,
+      mask: newMask,
+      bounds: remappedBounds,
+      scaleFactor: existingScaleFactor,
+      selected: false,
+      label: -1, // Will be reassigned
+      avgColor: subRegion.avgColor,
+      adjacentIndices: []
+    });
+  }
+
+  // Clean up sub-regions that were filtered out (edgeMap)
+  if (subResult.edgeMap) subResult.edgeMap.delete();
+  croppedImage.delete();
+  combinedMask.delete();
+
+  console.log(`[Split] Kept ${newSubRegions.length} sub-regions after filtering`);
+
+  // Step 6: Build updated regions array
+  const selectedSet = new Set(selectedIndices);
+  const updatedRegions = [];
+
+  // Keep non-selected regions
+  for (let i = 0; i < regions.length; i++) {
+    if (!selectedSet.has(i)) {
+      updatedRegions.push(regions[i]);
+    } else {
+      // Clean up old selected region's OpenCV objects
+      cleanupMats(regions[i].contour, regions[i].mask);
+    }
+  }
+
+  // Add new sub-regions
+  for (const subRegion of newSubRegions) {
+    updatedRegions.push(subRegion);
+  }
+
+  // Step 7: Rebuild simple adjacency (clear all, not critical for basic functionality)
+  for (const region of updatedRegions) {
+    region.adjacentIndices = [];
+  }
+
+  return updatedRegions;
 }

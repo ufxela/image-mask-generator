@@ -9,8 +9,7 @@ import {
   getCanvasMousePosition,
   cleanupMats,
   selectSimilarRegions,
-  densifyContour,
-  rebuildRegionMask
+  splitRegions
 } from './utils/segmentation';
 import {
   computeHomography,
@@ -59,20 +58,15 @@ function App() {
   const [presenterSelectionRadius, setPresenterSelectionRadius] = useState(30); // Radius for segment selection in presenter mode
   const [presenterDragMode, setPresenterDragMode] = useState(null); // 'select' or 'deselect' - set on mousedown, maintained during drag
   const [showImageOverlay, setShowImageOverlay] = useState(false); // Toggle original image overlay in presenter mode
+  const [presenterRotation, setPresenterRotation] = useState(false); // Toggle 90° CW rotation for portrait images
+  const [presenterZoom, setPresenterZoom] = useState(1.0); // Zoom level (min 1.0)
+  const [presenterZoomOffset, setPresenterZoomOffset] = useState({ x: 0, y: 0 }); // Pan offset for zoom
 
   // Polygon tool state
   const [polygonPoints, setPolygonPoints] = useState([]); // Points of polygon being drawn
   const [polygonColor, setPolygonColor] = useState('white'); // 'white' or 'black'
   const [editingPolygonIndex, setEditingPolygonIndex] = useState(null); // Index into brushStrokes of polygon being edited
   const [editingPointIndex, setEditingPointIndex] = useState(null); // Index of point being dragged
-
-  // Segment boundary editing state
-  const [segEditRegionIndex, setSegEditRegionIndex] = useState(null);
-  const [segEditPointIndex, setSegEditPointIndex] = useState(null);
-  const [segEditDragStart, setSegEditDragStart] = useState(null);
-  const [segEditOriginalPoints, setSegEditOriginalPoints] = useState(null);
-  const [segEditInfluenceRadius, setSegEditInfluenceRadius] = useState(30);
-  const [contoursAreDensified, setContoursAreDensified] = useState(false);
 
   // Transform mode state
   const [transformMode, setTransformMode] = useState(false);
@@ -228,14 +222,13 @@ function App() {
     setTimeout(() => {
       try {
         const derivedSensitivity = detailLevel;
-        const derivedRegionSize = Math.round(10 + (detailLevel - 1) * (30 / 9));
+        const derivedRegionSize = Math.round(10 + (detailLevel - 1) * (70 / 19));
         const result = segmentImage(originalImage, derivedSensitivity, derivedRegionSize, cv, mergeStrength);
         const newRegions = result.regions;
 
         // Store edge map for segment boundary editing
         if (edgeMapRef.current) cleanupMats(edgeMapRef.current);
         edgeMapRef.current = result.edgeMap;
-        setContoursAreDensified(false);
 
         // If we have a saved selection, mark overlapping regions as selected
         if (savedSelectionMask) {
@@ -652,6 +645,9 @@ function App() {
     setPresenterDragMode(null);
     setCurrentStroke(null);
     setPresenterMousePos(null);
+    setPresenterRotation(false);
+    setPresenterZoom(1.0);
+    setPresenterZoomOffset({ x: 0, y: 0 });
 
     // Exit fullscreen
     if (document.fullscreenElement) {
@@ -661,6 +657,84 @@ function App() {
     } else if (document.mozFullScreenElement) {
       document.mozCancelFullScreen();
     }
+  }, []);
+
+  // Helper: compute display layout for presenter mode (rotation-aware)
+  const getPresenterLayout = useCallback((canvas, image, rotation) => {
+    const effectiveCols = rotation ? image.rows : image.cols;
+    const effectiveRows = rotation ? image.cols : image.rows;
+    const imageAspect = effectiveCols / effectiveRows;
+    const canvasAspect = canvas.width / canvas.height;
+
+    let displayWidth, displayHeight, offsetX, offsetY;
+
+    if (imageAspect > canvasAspect) {
+      displayWidth = canvas.width;
+      displayHeight = canvas.width / imageAspect;
+      offsetX = 0;
+      offsetY = (canvas.height - displayHeight) / 2;
+    } else {
+      displayHeight = canvas.height;
+      displayWidth = canvas.height * imageAspect;
+      offsetX = (canvas.width - displayWidth) / 2;
+      offsetY = 0;
+    }
+
+    return { displayWidth, displayHeight, offsetX, offsetY };
+  }, []);
+
+  // Helper: convert screen coords to image coords (rotation-aware)
+  const screenToImage = useCallback((sx, sy, layout, image, rotation) => {
+    const { displayWidth, displayHeight, offsetX, offsetY } = layout;
+    if (rotation) {
+      const centerX = offsetX + displayWidth / 2;
+      const centerY = offsetY + displayHeight / 2;
+      return {
+        imgX: ((sy - centerY + displayHeight / 2) / displayHeight) * image.cols,
+        imgY: ((centerX - sx + displayWidth / 2) / displayWidth) * image.rows
+      };
+    }
+    return {
+      imgX: ((sx - offsetX) / displayWidth) * image.cols,
+      imgY: ((sy - offsetY) / displayHeight) * image.rows
+    };
+  }, []);
+
+  // Helper: convert image coords to screen coords (rotation-aware)
+  const imageToScreen = useCallback((imgX, imgY, layout, image, rotation) => {
+    const { displayWidth, displayHeight, offsetX, offsetY } = layout;
+    if (rotation) {
+      return {
+        sx: offsetX + displayWidth - (imgY / image.rows) * displayWidth,
+        sy: offsetY + (imgX / image.cols) * displayHeight
+      };
+    }
+    return {
+      sx: (imgX / image.cols) * displayWidth + offsetX,
+      sy: (imgY / image.rows) * displayHeight + offsetY
+    };
+  }, []);
+
+  // Helper: draw an image source onto the canvas respecting rotation
+  const drawRotated = useCallback((ctx, source, layout, rotation) => {
+    const { displayWidth, displayHeight, offsetX, offsetY } = layout;
+    if (rotation) {
+      ctx.save();
+      ctx.translate(offsetX + displayWidth / 2, offsetY + displayHeight / 2);
+      ctx.rotate(Math.PI / 2);
+      ctx.drawImage(source, -displayHeight / 2, -displayWidth / 2, displayHeight, displayWidth);
+      ctx.restore();
+    } else {
+      ctx.drawImage(source, offsetX, offsetY, displayWidth, displayHeight);
+    }
+  }, []);
+
+  // Helper: convert screen coords to world (unzoomed canvas) coords
+  const screenToWorld = useCallback((screenX, screenY, zoom, offset) => {
+    return {
+      x: (screenX - offset.x) / zoom,
+      y: (screenY - offset.y) / zoom
+    };
   }, []);
 
   /**
@@ -680,24 +754,17 @@ function App() {
     ctx.fillStyle = 'black';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+    // Apply zoom transform
+    ctx.save();
+    ctx.translate(presenterZoomOffset.x, presenterZoomOffset.y);
+    ctx.scale(presenterZoom, presenterZoom);
+
+    // Scale factor for line widths — keeps lines constant screen-pixel size when zoomed
+    const zoomLineScale = 1 / presenterZoom;
+
     // If in transform mode, show the original color image instead of the mask
     if (transformMode) {
-      const imageAspect = originalImage.cols / originalImage.rows;
-      const canvasAspect = canvas.width / canvas.height;
-
-      let displayWidth, displayHeight, offsetX, offsetY;
-
-      if (imageAspect > canvasAspect) {
-        displayWidth = canvas.width;
-        displayHeight = canvas.width / imageAspect;
-        offsetX = 0;
-        offsetY = (canvas.height - displayHeight) / 2;
-      } else {
-        displayHeight = canvas.height;
-        displayWidth = canvas.height * imageAspect;
-        offsetX = (canvas.width - displayWidth) / 2;
-        offsetY = 0;
-      }
+      const { displayWidth, displayHeight, offsetX, offsetY } = getPresenterLayout(canvas, originalImage, presenterRotation);
 
       // Convert OpenCV Mat to canvas image
       const tempCanvas = document.createElement('canvas');
@@ -706,7 +773,7 @@ function App() {
       cv.imshow(tempCanvas, originalImage);
 
       // Draw the original image
-      ctx.drawImage(tempCanvas, offsetX, offsetY, displayWidth, displayHeight);
+      drawRotated(ctx, tempCanvas, { displayWidth, displayHeight, offsetX, offsetY }, presenterRotation);
 
       // Draw transform points
       for (let i = 0; i < transformPoints.length; i++) {
@@ -718,7 +785,7 @@ function App() {
         ctx.fillStyle = isSource ? 'red' : 'lime';
         ctx.fill();
         ctx.strokeStyle = 'white';
-        ctx.lineWidth = 1;
+        ctx.lineWidth = 1 * zoomLineScale;
         ctx.stroke();
 
         // Add number label
@@ -727,28 +794,12 @@ function App() {
         ctx.fillText(String(Math.floor(i / 2) + 1), point.x - 3, point.y + 3);
       }
 
+      ctx.restore();
       return { displayWidth, displayHeight, offsetX, offsetY };
     }
 
     // Calculate scaling to fit the mask in the canvas while maintaining aspect ratio
-    const imageAspect = originalImage.cols / originalImage.rows;
-    const canvasAspect = canvas.width / canvas.height;
-
-    let displayWidth, displayHeight, offsetX, offsetY;
-
-    if (imageAspect > canvasAspect) {
-      // Image is wider than canvas
-      displayWidth = canvas.width;
-      displayHeight = canvas.width / imageAspect;
-      offsetX = 0;
-      offsetY = (canvas.height - displayHeight) / 2;
-    } else {
-      // Image is taller than canvas
-      displayHeight = canvas.height;
-      displayWidth = canvas.height * imageAspect;
-      offsetX = (canvas.width - displayWidth) / 2;
-      offsetY = 0;
-    }
+    const { displayWidth, displayHeight, offsetX, offsetY } = getPresenterLayout(canvas, originalImage, presenterRotation);
 
     // Create the mask from selected regions
     const mask = cv.Mat.zeros(originalImage.rows, originalImage.cols, cv.CV_8UC1);
@@ -780,7 +831,7 @@ function App() {
     mask.delete();
 
     // Draw the mask scaled to fit
-    ctx.drawImage(tempCanvas, offsetX, offsetY, displayWidth, displayHeight);
+    drawRotated(ctx, tempCanvas, { displayWidth, displayHeight, offsetX, offsetY }, presenterRotation);
 
     // Optionally overlay the original image at low opacity (toggled with 'O' key)
     if (showImageOverlay) {
@@ -789,7 +840,7 @@ function App() {
       imgCanvas.height = originalImage.rows;
       cv.imshow(imgCanvas, originalImage);
       ctx.globalAlpha = 0.25;
-      ctx.drawImage(imgCanvas, offsetX, offsetY, displayWidth, displayHeight);
+      drawRotated(ctx, imgCanvas, { displayWidth, displayHeight, offsetX, offsetY }, presenterRotation);
       ctx.globalAlpha = 1.0;
     }
 
@@ -806,7 +857,7 @@ function App() {
           ctx.globalAlpha = strokeOpacity;
           ctx.fillStyle = color;
           ctx.strokeStyle = color;
-          ctx.lineWidth = 1;
+          ctx.lineWidth = 1 * zoomLineScale;
           if (stroke.points.length >= 3) {
             ctx.beginPath();
             ctx.moveTo(stroke.points[0].x, stroke.points[0].y);
@@ -857,7 +908,7 @@ function App() {
     if (presenterSubMode === 'polygon' && polygonPoints.length > 0) {
       const polyColor = polygonColor === 'white' ? 'white' : 'black';
       ctx.strokeStyle = polyColor;
-      ctx.lineWidth = 2;
+      ctx.lineWidth = 2 * zoomLineScale;
       ctx.setLineDash([]);
 
       // Draw completed edges
@@ -879,7 +930,7 @@ function App() {
         ctx.fillStyle = i === 0 ? 'red' : polyColor;
         ctx.fill();
         ctx.strokeStyle = 'rgba(0,0,0,0.5)';
-        ctx.lineWidth = 1;
+        ctx.lineWidth = 1 * zoomLineScale;
         ctx.stroke();
       }
 
@@ -891,7 +942,7 @@ function App() {
           ctx.beginPath();
           ctx.arc(polygonPoints[0].x, polygonPoints[0].y, 15, 0, Math.PI * 2);
           ctx.strokeStyle = 'red';
-          ctx.lineWidth = 3;
+          ctx.lineWidth = 3 * zoomLineScale;
           ctx.stroke();
         }
       }
@@ -910,67 +961,8 @@ function App() {
           ctx.fillStyle = isActive ? 'yellow' : 'cyan';
           ctx.fill();
           ctx.strokeStyle = 'rgba(0,0,0,0.5)';
-          ctx.lineWidth = 1;
+          ctx.lineWidth = 1 * zoomLineScale;
           ctx.stroke();
-        }
-      }
-    }
-
-    // Draw segment boundary edit handles
-    if (presenterSubMode === 'segment-edit') {
-      for (let ri = 0; ri < regions.length; ri++) {
-        const region = regions[ri];
-        const sf = region.scaleFactor || 1;
-        const scale = 1 / sf;
-
-        // Draw contour outline
-        ctx.strokeStyle = region.selected ? 'rgba(0,255,0,0.6)' : 'rgba(255,255,255,0.4)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        for (let pi = 0; pi < region.contour.rows; pi++) {
-          const cx = region.contour.data32S[pi * 2] * scale;
-          const cy = region.contour.data32S[pi * 2 + 1] * scale;
-          const sx = (cx / originalImage.cols) * displayWidth + offsetX;
-          const sy = (cy / originalImage.rows) * displayHeight + offsetY;
-          if (pi === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        }
-        ctx.closePath();
-        ctx.stroke();
-
-        // Draw vertex handles (only for the region being edited, or on hover)
-        if (ri === segEditRegionIndex || !segEditRegionIndex) {
-          // Find nearest point to cursor for highlighting
-          let nearestInRegion = -1;
-          if (presenterMousePos && segEditRegionIndex === null) {
-            let bestDist = 15;
-            for (let pi = 0; pi < region.contour.rows; pi++) {
-              const cx = region.contour.data32S[pi * 2] * scale;
-              const cy = region.contour.data32S[pi * 2 + 1] * scale;
-              const sx = (cx / originalImage.cols) * displayWidth + offsetX;
-              const sy = (cy / originalImage.rows) * displayHeight + offsetY;
-              const dx = presenterMousePos.x - sx;
-              const dy = presenterMousePos.y - sy;
-              const dist = Math.sqrt(dx * dx + dy * dy);
-              if (dist < bestDist) { bestDist = dist; nearestInRegion = pi; }
-            }
-          }
-
-          // Only draw handles for the nearest region or the active one
-          if (ri === segEditRegionIndex || nearestInRegion >= 0) {
-            for (let pi = 0; pi < region.contour.rows; pi += Math.max(1, Math.floor(region.contour.rows / 100))) {
-              const cx = region.contour.data32S[pi * 2] * scale;
-              const cy = region.contour.data32S[pi * 2 + 1] * scale;
-              const sx = (cx / originalImage.cols) * displayWidth + offsetX;
-              const sy = (cy / originalImage.rows) * displayHeight + offsetY;
-              const isActive = ri === segEditRegionIndex && pi === segEditPointIndex;
-              const isNearest = pi === nearestInRegion;
-              ctx.beginPath();
-              ctx.arc(sx, sy, isActive ? 6 : (isNearest ? 5 : 2), 0, Math.PI * 2);
-              ctx.fillStyle = isActive ? 'yellow' : (isNearest ? 'orange' : 'rgba(0,200,255,0.5)');
-              ctx.fill();
-            }
-          }
         }
       }
     }
@@ -991,7 +983,7 @@ function App() {
           ctx.globalAlpha = 0.5;
           ctx.strokeStyle = 'red';
           ctx.fillStyle = 'rgba(255, 0, 0, 0.3)';
-          ctx.lineWidth = 3;
+          ctx.lineWidth = 3 * zoomLineScale;
 
           // Create scaled contour for drawing
           const scaledContour = new cv.Mat(region.contour.rows, 1, cv.CV_32SC2);
@@ -1000,8 +992,9 @@ function App() {
             const origY = region.contour.data32S[i * 2 + 1] * scale;
 
             // Convert from image coordinates to canvas coordinates
-            scaledContour.data32S[i * 2] = Math.round((origX / originalImage.cols) * displayWidth + offsetX);
-            scaledContour.data32S[i * 2 + 1] = Math.round((origY / originalImage.rows) * displayHeight + offsetY);
+            const { sx, sy } = imageToScreen(origX, origY, { displayWidth, displayHeight, offsetX, offsetY }, originalImage, presenterRotation);
+            scaledContour.data32S[i * 2] = Math.round(sx);
+            scaledContour.data32S[i * 2 + 1] = Math.round(sy);
           }
 
           // Draw the contour as a path
@@ -1042,7 +1035,7 @@ function App() {
               ctx.globalAlpha = 0.4;
               ctx.strokeStyle = 'lime';
               ctx.fillStyle = 'rgba(0, 255, 0, 0.3)';
-              ctx.lineWidth = 3;
+              ctx.lineWidth = 3 * zoomLineScale;
 
               // Create scaled contour for drawing
               const scaledContour = new cv.Mat(region.contour.rows, 1, cv.CV_32SC2);
@@ -1051,8 +1044,9 @@ function App() {
                 const origY = region.contour.data32S[i * 2 + 1] * scale;
 
                 // Convert from image coordinates to canvas coordinates
-                scaledContour.data32S[i * 2] = Math.round((origX / originalImage.cols) * displayWidth + offsetX);
-                scaledContour.data32S[i * 2 + 1] = Math.round((origY / originalImage.rows) * displayHeight + offsetY);
+                const { sx, sy } = imageToScreen(origX, origY, { displayWidth, displayHeight, offsetX, offsetY }, originalImage, presenterRotation);
+                scaledContour.data32S[i * 2] = Math.round(sx);
+                scaledContour.data32S[i * 2 + 1] = Math.round(sy);
               }
 
               // Draw the contour as a path
@@ -1079,8 +1073,8 @@ function App() {
           ctx.globalAlpha = 0.3;
           ctx.strokeStyle = 'white';
           ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
-          ctx.lineWidth = 2;
-          ctx.setLineDash([5, 5]);
+          ctx.lineWidth = 2 * zoomLineScale;
+          ctx.setLineDash([5 * zoomLineScale, 5 * zoomLineScale]);
 
           ctx.beginPath();
           ctx.arc(presenterMousePos.x, presenterMousePos.y, presenterSelectionRadius, 0, Math.PI * 2);
@@ -1098,7 +1092,7 @@ function App() {
         ctx.globalAlpha = 0.7;
         ctx.strokeStyle = presenterSubMode === 'eraser' ? 'red' : 'white';
         ctx.fillStyle = brushColor;
-        ctx.lineWidth = 2;
+        ctx.lineWidth = 2 * zoomLineScale;
 
         ctx.beginPath();
         ctx.arc(presenterMousePos.x, presenterMousePos.y, brushSize / 2, 0, Math.PI * 2);
@@ -1108,8 +1102,9 @@ function App() {
       }
     }
 
+    ctx.restore();
     return { displayWidth, displayHeight, offsetX, offsetY };
-  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize, transformMode, transformPoints, homographyMatrix, presenterMousePos, presenterSubMode, presenterSelectionRadius, showImageOverlay, polygonPoints, polygonColor, editingPolygonIndex, editingPointIndex]);
+  }, [originalImage, regions, cv, brushStrokes, currentStroke, brushSize, transformMode, transformPoints, homographyMatrix, presenterMousePos, presenterSubMode, presenterSelectionRadius, showImageOverlay, polygonPoints, polygonColor, editingPolygonIndex, editingPointIndex, presenterRotation, getPresenterLayout, screenToImage, imageToScreen, drawRotated, presenterZoom, presenterZoomOffset]);
 
   /**
    * Save the current state as the base (untransformed) state
@@ -1604,6 +1599,11 @@ function App() {
             setShowImageOverlay(prev => !prev);
           }
           break;
+        case 'r':
+          if (!transformMode) {
+            setPresenterRotation(prev => !prev);
+          }
+          break;
         case 'p':
           if (!transformMode) {
             if (presenterSubMode === 'polygon') {
@@ -1620,31 +1620,6 @@ function App() {
             setPresenterSubMode(prev => prev === 'polygon-edit' ? 'segment' : 'polygon-edit');
             setEditingPolygonIndex(null);
             setEditingPointIndex(null);
-          }
-          break;
-        case 'g':
-          if (!transformMode) {
-            if (presenterSubMode !== 'segment-edit') {
-              // Entering segment-edit mode: densify contours if needed
-              if (!contoursAreDensified && cv) {
-                const newRegions = regions.map(region => {
-                  const densified = densifyContour(region.contour, 5, cv);
-                  const oldContour = region.contour;
-                  const newRegion = { ...region, contour: densified };
-                  if (oldContour && !oldContour.isDeleted()) oldContour.delete();
-                  rebuildRegionMask(newRegion, cv);
-                  return newRegion;
-                });
-                setRegions(newRegions);
-                regionsRef.current = newRegions;
-                setContoursAreDensified(true);
-              }
-              setPresenterSubMode('segment-edit');
-            } else {
-              setPresenterSubMode('segment');
-            }
-            setSegEditRegionIndex(null);
-            setSegEditPointIndex(null);
           }
           break;
         case 'z':
@@ -1678,6 +1653,64 @@ function App() {
             } else {
               // Geometric scaling for brush size (20% increase), no upper limit
               setBrushSize(prev => Math.round(prev * 1.2));
+            }
+          }
+          break;
+        case 'h':
+          if (!transformMode) {
+            setPresenterZoom(1.0);
+            setPresenterZoomOffset({ x: 0, y: 0 });
+          }
+          break;
+        case '=':
+        case '+':
+          if (!transformMode) {
+            e.preventDefault();
+            const zoomIn = Math.max(1.0, presenterZoom * 1.2);
+            const cx = presenterMousePos ? presenterMousePos.x * presenterZoom + presenterZoomOffset.x : window.innerWidth / 2;
+            const cy = presenterMousePos ? presenterMousePos.y * presenterZoom + presenterZoomOffset.y : window.innerHeight / 2;
+            const wx = (cx - presenterZoomOffset.x) / presenterZoom;
+            const wy = (cy - presenterZoomOffset.y) / presenterZoom;
+            setPresenterZoomOffset({ x: cx - wx * zoomIn, y: cy - wy * zoomIn });
+            setPresenterZoom(zoomIn);
+          }
+          break;
+        case '-':
+          if (!transformMode) {
+            e.preventDefault();
+            const zoomOut = Math.max(1.0, presenterZoom / 1.2);
+            if (zoomOut === 1.0) {
+              setPresenterZoomOffset({ x: 0, y: 0 });
+            } else {
+              const cx2 = presenterMousePos ? presenterMousePos.x * presenterZoom + presenterZoomOffset.x : window.innerWidth / 2;
+              const cy2 = presenterMousePos ? presenterMousePos.y * presenterZoom + presenterZoomOffset.y : window.innerHeight / 2;
+              const wx2 = (cx2 - presenterZoomOffset.x) / presenterZoom;
+              const wy2 = (cy2 - presenterZoomOffset.y) / presenterZoom;
+              setPresenterZoomOffset({ x: cx2 - wx2 * zoomOut, y: cy2 - wy2 * zoomOut });
+            }
+            setPresenterZoom(zoomOut);
+          }
+          break;
+        case 'f':
+          if (!transformMode && originalImage && cv) {
+            // Split selected regions into finer sub-segments
+            const selectedIndices = regions.reduce((acc, r, i) => r.selected ? [...acc, i] : acc, []);
+            if (selectedIndices.length > 0) {
+              try {
+                setStatus({ message: 'Splitting selected regions...', type: 'info' });
+                const splitSensitivity = Math.min(20, detailLevel + 5);
+                const splitRegionSize = Math.round(10 + (splitSensitivity - 1) * (70 / 19));
+                const newRegions = splitRegions(originalImage, regions, selectedIndices, cv, splitSensitivity, splitRegionSize, mergeStrength);
+                setRegions(newRegions);
+                regionsRef.current = newRegions;
+                drawSegmentation(originalImage, newRegions, segmentationCanvasRef.current, -1, cv);
+                createMask(originalImage, newRegions, maskCanvasRef.current, cv);
+                pushHistory(newRegions, brushStrokes);
+                setStatus({ message: `Split into ${newRegions.length} regions`, type: 'success' });
+              } catch (error) {
+                console.error('[Split] Error:', error);
+                setStatus({ message: 'Error splitting regions: ' + error.message, type: 'error' });
+              }
             }
           }
           break;
@@ -1715,20 +1748,44 @@ function App() {
       }
     };
 
+    const handleWheel = (e) => {
+      e.preventDefault();
+      const factor = e.deltaY > 0 ? 0.9 : 1.1;
+      const newZoom = Math.max(1.0, presenterZoom * factor);
+
+      // Keep the point under cursor fixed
+      const mouseX = e.clientX;
+      const mouseY = e.clientY;
+      const worldX = (mouseX - presenterZoomOffset.x) / presenterZoom;
+      const worldY = (mouseY - presenterZoomOffset.y) / presenterZoom;
+
+      if (newZoom === 1.0) {
+        setPresenterZoomOffset({ x: 0, y: 0 });
+      } else {
+        setPresenterZoomOffset({
+          x: mouseX - worldX * newZoom,
+          y: mouseY - worldY * newZoom
+        });
+      }
+      setPresenterZoom(newZoom);
+    };
+
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('wheel', handleWheel, { passive: false });
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('wheel', handleWheel);
     };
-  }, [presenterMode, transformMode, presenterSubMode, exitPresenterMode, homographyMatrix, transformPoints, applyTransformation, saveBaseState, restoreBaseState, undo, redo]);
+  }, [presenterMode, transformMode, presenterSubMode, exitPresenterMode, homographyMatrix, transformPoints, applyTransformation, saveBaseState, restoreBaseState, undo, redo, presenterZoom, presenterZoomOffset, originalImage, regions, cv, detailLevel, mergeStrength, brushStrokes, pushHistory, presenterMousePos]);
 
   // Presenter mode: Render canvas when state changes
   useEffect(() => {
     if (presenterMode) {
       renderPresenterCanvas();
     }
-  }, [presenterMode, regions, brushStrokes, currentStroke, transformMode, transformPoints, renderPresenterCanvas, showImageOverlay]);
+  }, [presenterMode, regions, brushStrokes, currentStroke, transformMode, transformPoints, renderPresenterCanvas, showImageOverlay, presenterRotation, presenterZoom, presenterZoomOffset]);
 
   // Presenter mode: Handle window resize
   useEffect(() => {
@@ -1750,8 +1807,11 @@ function App() {
 
     const canvas = presenterCanvasRef.current;
     const rect = canvas.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
+    const screenX = event.clientX - rect.left;
+    const screenY = event.clientY - rect.top;
+
+    // Inverse-transform screen coords to world (unzoomed) coords
+    const { x: x, y: y } = screenToWorld(screenX, screenY, presenterZoom, presenterZoomOffset);
 
     // Handle transform mode point collection
     if (transformMode) {
@@ -1792,22 +1852,8 @@ function App() {
 
     if (presenterSubMode === 'segment') {
       // Convert screen coordinates to image coordinates
-      const imageAspect = originalImage.cols / originalImage.rows;
-      const canvasAspect = canvas.width / canvas.height;
-
-      let displayWidth, displayHeight, offsetX, offsetY;
-
-      if (imageAspect > canvasAspect) {
-        displayWidth = canvas.width;
-        displayHeight = canvas.width / imageAspect;
-        offsetX = 0;
-        offsetY = (canvas.height - displayHeight) / 2;
-      } else {
-        displayHeight = canvas.height;
-        displayWidth = canvas.height * imageAspect;
-        offsetX = (canvas.width - displayWidth) / 2;
-        offsetY = 0;
-      }
+      const layout = getPresenterLayout(canvas, originalImage, presenterRotation);
+      const { displayWidth, displayHeight, offsetX, offsetY } = layout;
 
       // Check if click is within the displayed image bounds
       if (x < offsetX || x > offsetX + displayWidth || y < offsetY || y > offsetY + displayHeight) {
@@ -1815,8 +1861,7 @@ function App() {
       }
 
       // Convert to image coordinates
-      const imgX = ((x - offsetX) / displayWidth) * originalImage.cols;
-      const imgY = ((y - offsetY) / displayHeight) * originalImage.rows;
+      const { imgX, imgY } = screenToImage(x, y, layout, originalImage, presenterRotation);
 
       // Shift+Click: Select Similar regions
       if (event.shiftKey) {
@@ -1925,52 +1970,8 @@ function App() {
         setPresenterIsDragging(true);
       }
       return;
-    } else if (presenterSubMode === 'segment-edit') {
-      // Find nearest contour point across all regions
-      const imageAspect = originalImage.cols / originalImage.rows;
-      const canvasAspect = canvas.width / canvas.height;
-      let dW, dH, oX, oY;
-      if (imageAspect > canvasAspect) { dW = canvas.width; dH = canvas.width / imageAspect; oX = 0; oY = (canvas.height - dH) / 2; }
-      else { dH = canvas.height; dW = canvas.height * imageAspect; oX = (canvas.width - dW) / 2; oY = 0; }
-
-      let bestDist = 15;
-      let bestRegion = null;
-      let bestPoint = null;
-      for (let ri = 0; ri < regions.length; ri++) {
-        const region = regions[ri];
-        const sf = region.scaleFactor || 1;
-        const scale = 1 / sf;
-        for (let pi = 0; pi < region.contour.rows; pi++) {
-          const cx = region.contour.data32S[pi * 2] * scale;
-          const cy = region.contour.data32S[pi * 2 + 1] * scale;
-          const sx = (cx / originalImage.cols) * dW + oX;
-          const sy = (cy / originalImage.rows) * dH + oY;
-          const dx = x - sx;
-          const dy = y - sy;
-          const dist = Math.sqrt(dx * dx + dy * dy);
-          if (dist < bestDist) { bestDist = dist; bestRegion = ri; bestPoint = pi; }
-        }
-      }
-      if (bestRegion !== null) {
-        setSegEditRegionIndex(bestRegion);
-        setSegEditPointIndex(bestPoint);
-        // Store original contour points for falloff computation
-        const contour = regions[bestRegion].contour;
-        const pts = [];
-        for (let i = 0; i < contour.rows; i++) {
-          pts.push({ x: contour.data32S[i * 2], y: contour.data32S[i * 2 + 1] });
-        }
-        setSegEditOriginalPoints(pts);
-        const sf = regions[bestRegion].scaleFactor || 1;
-        setSegEditDragStart({
-          x: ((x - oX) / dW) * originalImage.cols * sf,
-          y: ((y - oY) / dH) * originalImage.rows * sf
-        });
-        setPresenterIsDragging(true);
-      }
-      return;
     }
-  }, [presenterMode, presenterSubMode, originalImage, regions, cv, brushSize, transformMode, transformPoints, homographyMatrix, mergeStrength, polygonPoints, polygonColor, brushStrokes, pushHistory]);
+  }, [presenterMode, presenterSubMode, originalImage, regions, cv, brushSize, transformMode, transformPoints, homographyMatrix, mergeStrength, polygonPoints, polygonColor, brushStrokes, pushHistory, presenterRotation, getPresenterLayout, screenToImage, imageToScreen, presenterZoom, presenterZoomOffset, screenToWorld]);
 
   /**
    * Presenter mode: Handle mouse move
@@ -1980,32 +1981,22 @@ function App() {
 
     const canvas = presenterCanvasRef.current;
     const rect = canvas.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
+    const screenX = event.clientX - rect.left;
+    const screenY = event.clientY - rect.top;
+
+    // Inverse-transform screen coords to world (unzoomed) coords
+    const { x: x, y: y } = screenToWorld(screenX, screenY, presenterZoom, presenterZoomOffset);
 
     // Calculate image coordinates for hover preview
-    const imageAspect = originalImage.cols / originalImage.rows;
-    const canvasAspect = canvas.width / canvas.height;
-
-    let displayWidth, displayHeight, offsetX, offsetY;
-
-    if (imageAspect > canvasAspect) {
-      displayWidth = canvas.width;
-      displayHeight = canvas.width / imageAspect;
-      offsetX = 0;
-      offsetY = (canvas.height - displayHeight) / 2;
-    } else {
-      displayHeight = canvas.height;
-      displayWidth = canvas.height * imageAspect;
-      offsetX = (canvas.width - displayWidth) / 2;
-      offsetY = 0;
-    }
+    const layout = getPresenterLayout(canvas, originalImage, presenterRotation);
+    const { displayWidth, displayHeight, offsetX, offsetY } = layout;
 
     // Check if cursor is within the displayed image bounds
     let imgX, imgY;
     if (x >= offsetX && x <= offsetX + displayWidth && y >= offsetY && y <= offsetY + displayHeight) {
-      imgX = ((x - offsetX) / displayWidth) * originalImage.cols;
-      imgY = ((y - offsetY) / displayHeight) * originalImage.rows;
+      const coords = screenToImage(x, y, layout, originalImage, presenterRotation);
+      imgX = coords.imgX;
+      imgY = coords.imgY;
       setPresenterMousePos({ x, y, imgX, imgY });
     } else {
       setPresenterMousePos(null);
@@ -2075,86 +2066,8 @@ function App() {
       newStrokes[editingPolygonIndex] = stroke;
       setBrushStrokes(newStrokes);
       brushStrokesRef.current = newStrokes;
-    } else if (presenterSubMode === 'segment-edit' && presenterIsDragging && segEditRegionIndex !== null && segEditPointIndex !== null && segEditOriginalPoints && segEditDragStart) {
-      // Drag segment boundary with Gaussian falloff
-      const region = regions[segEditRegionIndex];
-      const sf = region.scaleFactor || 1;
-
-      const canvas2 = presenterCanvasRef.current;
-      const imageAspect2 = originalImage.cols / originalImage.rows;
-      const canvasAspect2 = canvas2.width / canvas2.height;
-      let dW2, dH2, oX2, oY2;
-      if (imageAspect2 > canvasAspect2) { dW2 = canvas2.width; dH2 = canvas2.width / imageAspect2; oX2 = 0; oY2 = (canvas2.height - dH2) / 2; }
-      else { dH2 = canvas2.height; dW2 = canvas2.height * imageAspect2; oX2 = (canvas2.width - dW2) / 2; oY2 = 0; }
-
-      // Convert current mouse to downscaled coords
-      const curX = ((x - oX2) / dW2) * originalImage.cols * sf;
-      const curY = ((y - oY2) / dH2) * originalImage.rows * sf;
-      const deltaX = curX - segEditDragStart.x;
-      const deltaY = curY - segEditDragStart.y;
-
-      const numPts = segEditOriginalPoints.length;
-      const sigma = segEditInfluenceRadius / 2;
-
-      // Compute per-point deltas for the edited region
-      const pointDeltas = [];
-      const newContour = new cv.Mat(numPts, 1, cv.CV_32SC2);
-
-      for (let i = 0; i < numPts; i++) {
-        let dAlong = Math.abs(i - segEditPointIndex);
-        dAlong = Math.min(dAlong, numPts - dAlong);
-        const weight = Math.exp(-(dAlong * dAlong) / (2 * sigma * sigma));
-        const dx = deltaX * weight;
-        const dy = deltaY * weight;
-        pointDeltas.push({ ox: segEditOriginalPoints[i].x, oy: segEditOriginalPoints[i].y, dx, dy });
-        newContour.data32S[i * 2] = Math.round(segEditOriginalPoints[i].x + dx);
-        newContour.data32S[i * 2 + 1] = Math.round(segEditOriginalPoints[i].y + dy);
-      }
-
-      const newRegions = [...regions];
-      const oldContour = newRegions[segEditRegionIndex].contour;
-      newRegions[segEditRegionIndex] = { ...newRegions[segEditRegionIndex], contour: newContour };
-      if (oldContour && !oldContour.isDeleted()) oldContour.delete();
-
-      // Move shared boundary points on adjacent regions to avoid voids
-      const adjacentIndices = region.adjacentIndices || [];
-      const proximityThreshold = 4; // pixels in downscaled space
-      for (const adjIdx of adjacentIndices) {
-        const adjRegion = newRegions[adjIdx];
-        const adjContour = adjRegion.contour;
-        let modified = false;
-        const adjNew = adjContour.clone();
-
-        for (let ai = 0; ai < adjContour.rows; ai++) {
-          const ax = adjContour.data32S[ai * 2];
-          const ay = adjContour.data32S[ai * 2 + 1];
-
-          // Check if this adjacent point was near any of the original moved points
-          for (const pd of pointDeltas) {
-            if (Math.abs(pd.dx) < 0.5 && Math.abs(pd.dy) < 0.5) continue;
-            const dist = Math.sqrt((ax - pd.ox) ** 2 + (ay - pd.oy) ** 2);
-            if (dist < proximityThreshold) {
-              adjNew.data32S[ai * 2] = Math.round(ax + pd.dx);
-              adjNew.data32S[ai * 2 + 1] = Math.round(ay + pd.dy);
-              modified = true;
-              break;
-            }
-          }
-        }
-
-        if (modified) {
-          const oldAdj = newRegions[adjIdx].contour;
-          newRegions[adjIdx] = { ...newRegions[adjIdx], contour: adjNew };
-          if (oldAdj && !oldAdj.isDeleted()) oldAdj.delete();
-        } else {
-          adjNew.delete();
-        }
-      }
-
-      setRegions(newRegions);
-      regionsRef.current = newRegions;
     }
-  }, [presenterMode, presenterIsDragging, presenterSubMode, presenterDragMode, currentStroke, originalImage, regions, cv, presenterSelectionRadius, editingPolygonIndex, editingPointIndex, brushStrokes, segEditRegionIndex, segEditPointIndex, segEditOriginalPoints, segEditDragStart, segEditInfluenceRadius]);
+  }, [presenterMode, presenterIsDragging, presenterSubMode, presenterDragMode, currentStroke, originalImage, regions, cv, presenterSelectionRadius, editingPolygonIndex, editingPointIndex, brushStrokes, presenterRotation, getPresenterLayout, screenToImage, presenterZoom, presenterZoomOffset, screenToWorld]);
 
   /**
    * Presenter mode: Handle mouse leave
@@ -2245,79 +2158,8 @@ function App() {
       pushHistory(regions, brushStrokes);
       setEditingPolygonIndex(null);
       setEditingPointIndex(null);
-    } else if (presenterSubMode === 'segment-edit' && segEditRegionIndex !== null) {
-      // Edge snap: shift each moved contour point toward nearest strong edge
-      const region = regions[segEditRegionIndex];
-      const edgeMap = edgeMapRef.current;
-
-      if (edgeMap && cv && segEditOriginalPoints) {
-        const contour = region.contour;
-        const numPts = contour.rows;
-        const sigma = segEditInfluenceRadius / 2;
-
-        for (let i = 0; i < numPts; i++) {
-          let dAlong = Math.abs(i - segEditPointIndex);
-          dAlong = Math.min(dAlong, numPts - dAlong);
-          const weight = Math.exp(-(dAlong * dAlong) / (2 * sigma * sigma));
-          if (weight < 0.05) continue; // Skip unaffected points
-
-          const px = contour.data32S[i * 2];
-          const py = contour.data32S[i * 2 + 1];
-
-          // Compute local contour direction for perpendicular search
-          const prevI = (i - 1 + numPts) % numPts;
-          const nextI = (i + 1) % numPts;
-          const dx = contour.data32S[nextI * 2] - contour.data32S[prevI * 2];
-          const dy = contour.data32S[nextI * 2 + 1] - contour.data32S[prevI * 2 + 1];
-          const len = Math.sqrt(dx * dx + dy * dy) || 1;
-          const nx = -dy / len; // perpendicular
-          const ny = dx / len;
-
-          // Search along perpendicular for strongest edge
-          let bestT = 0;
-          let bestStrength = 0;
-          for (let t = -5; t <= 5; t++) {
-            const sx = Math.round(px + nx * t);
-            const sy = Math.round(py + ny * t);
-            if (sx >= 0 && sx < edgeMap.cols && sy >= 0 && sy < edgeMap.rows) {
-              const strength = edgeMap.ucharAt(sy, sx);
-              if (strength > bestStrength) {
-                bestStrength = strength;
-                bestT = t;
-              }
-            }
-          }
-
-          // Snap to edge if strong enough
-          if (bestStrength > 50 && bestT !== 0) {
-            contour.data32S[i * 2] = Math.round(px + nx * bestT);
-            contour.data32S[i * 2 + 1] = Math.round(py + ny * bestT);
-          }
-        }
-      }
-
-      // Rebuild mask from modified contour
-      rebuildRegionMask(region, cv);
-
-      // Also rebuild masks for any adjacent regions that had shared boundary points moved
-      const adjacentIndices = region.adjacentIndices || [];
-      for (const adjIdx of adjacentIndices) {
-        rebuildRegionMask(regions[adjIdx], cv);
-      }
-
-      // Update canvases
-      if (originalImage) {
-        drawSegmentation(originalImage, regions, segmentationCanvasRef.current, -1, cv);
-        createMask(originalImage, regions, maskCanvasRef.current, cv);
-      }
-
-      pushHistory(regions, brushStrokes);
-      setSegEditRegionIndex(null);
-      setSegEditPointIndex(null);
-      setSegEditDragStart(null);
-      setSegEditOriginalPoints(null);
     }
-  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes, regions, pushHistory, editingPolygonIndex, segEditRegionIndex, segEditPointIndex, segEditOriginalPoints, segEditInfluenceRadius, cv, originalImage]);
+  }, [presenterMode, presenterSubMode, currentStroke, brushStrokes, regions, pushHistory, editingPolygonIndex, cv, originalImage]);
 
   // Show loading state while OpenCV loads
   if (cvLoading) {
@@ -2386,7 +2228,7 @@ function App() {
               type="range"
               id="detailLevelSlider"
               min="1"
-              max="10"
+              max="20"
               value={detailLevel}
               onChange={(e) => setDetailLevel(parseInt(e.target.value))}
               disabled={!originalImage}
@@ -2619,7 +2461,6 @@ function App() {
                       presenterSubMode === 'brush-black' ? 'Black Brush' :
                       presenterSubMode === 'polygon' ? `Polygon (${polygonColor})` :
                       presenterSubMode === 'polygon-edit' ? 'Polygon Edit' :
-                      presenterSubMode === 'segment-edit' ? 'Segment Edge Edit' :
                       'Eraser'
                     }
                   </div>
@@ -2629,14 +2470,19 @@ function App() {
                     <div><kbd>B</kbd> Black Brush</div>
                     <div><kbd>E</kbd> Eraser</div>
                     <div><kbd>O</kbd> Image Overlay {showImageOverlay ? '(ON)' : '(off)'}</div>
+                    <div><kbd>R</kbd> Rotate 90° {presenterRotation ? '(ON)' : '(off)'}</div>
                     <div><kbd>P</kbd> Polygon Tool</div>
                     <div><kbd>D</kbd> Polygon Edit</div>
-                    <div><kbd>G</kbd> Segment Edge Edit</div>
                     <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)' }}>
                       <kbd>Z</kbd> Smaller {presenterSubMode === 'segment' ? 'Radius' : 'Brush'}
                     </div>
                     <div><kbd>X</kbd> Larger {presenterSubMode === 'segment' ? 'Radius' : 'Brush'}</div>
                     <div><kbd>T</kbd> Transform Mode</div>
+                    <div><kbd>F</kbd> Split Selected</div>
+                    <div style={{ marginTop: '8px', paddingTop: '8px', borderTop: '1px solid rgba(255,255,255,0.2)' }}>
+                      <kbd>+</kbd>/<kbd>-</kbd> Zoom in/out
+                    </div>
+                    <div><kbd>H</kbd> Reset Zoom {presenterZoom > 1.0 ? `(${presenterZoom.toFixed(1)}x)` : ''}</div>
                     <div style={{ marginTop: '8px' }}><kbd>ESC</kbd> Exit</div>
                   </div>
                 </>
@@ -2699,7 +2545,7 @@ function App() {
                 borderRadius: '8px',
                 opacity: presenterMousePos && presenterMousePos.x > window.innerWidth - 280 && presenterMousePos.y < 200 ? 0 : 1,
                 transition: 'opacity 0.15s',
-                pointerEvents: 'none',
+                pointerEvents: presenterZoom > 1.0 ? 'auto' : 'none',
                 fontFamily: 'monospace',
                 fontSize: '14px',
                 zIndex: 10000
@@ -2770,6 +2616,30 @@ function App() {
                       </button>
                     </div>
                   </>
+                )}
+                {presenterZoom > 1.0 && (
+                  <div style={{ marginTop: '12px', paddingTop: '12px', borderTop: '1px solid rgba(255,255,255,0.3)' }}>
+                    <div><strong>Zoom:</strong> {presenterZoom.toFixed(1)}x</div>
+                    <div style={{ marginTop: '8px' }}>
+                      <button
+                        onClick={() => {
+                          setPresenterZoom(1.0);
+                          setPresenterZoomOffset({ x: 0, y: 0 });
+                        }}
+                        style={{
+                          padding: '4px 12px',
+                          backgroundColor: '#666',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          fontSize: '12px'
+                        }}
+                      >
+                        Reset (H)
+                      </button>
+                    </div>
+                  </div>
                 )}
               </div>
             )}
