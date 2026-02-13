@@ -279,7 +279,7 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
 
     // Add supplementary grid markers to subdivide large uniform areas
     let nextLabel = markerCount + 1;
-    const maxGap = Math.max(8, Math.round(Math.min(imgCols, imgRows) / 60)); // ~12px - enforces small segments
+    const maxGap = Math.max(6, Math.round(Math.min(imgCols, imgRows) / 90)); // ~8px - smaller segments
     let supplementary = 0;
     for (let y = Math.floor(maxGap / 2); y < imgRows; y += maxGap) {
       for (let x = Math.floor(maxGap / 2); x < imgCols; x += maxGap) {
@@ -518,9 +518,9 @@ export function segmentImage(originalImage, sensitivity, regionSize, cv, mergeTh
     if (mergeThreshold > 0) {
       const uf = new UnionFind(mergeLabels.length);
       const groupSize = mergeLabels.map(l => labelCounts.get(l));
-      const maxMergedArea = totalPixels * 0.005; // 0.5% of image (was 3%)
-      const maxMergedWidth = Math.floor(imgCols / 80); // ~9px for 736px wide (was /40)
-      const maxMergedHeight = Math.floor(imgRows / 80); // ~13px for 1042px tall (was /40)
+      const maxMergedArea = totalPixels * 0.002; // 0.2% of image
+      const maxMergedWidth = Math.floor(imgCols / 120);
+      const maxMergedHeight = Math.floor(imgRows / 120);
 
       // Compute bounding boxes per label by scanning pixelLabels once
       const labelBounds = new Map();
